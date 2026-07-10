@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link
+      id="app-favicon"
+      rel="icon"
+      type="image/svg+xml"
+      href="/favicon.svg"
+    />
+    <title>b8im</title>
+    <style>
+      html,
+      body,
+      #app {
+        width: 100%;
+        height: 100%;
+        margin: 0;
+      }
+
+      body {
+        overflow: hidden;
+        background: #dfe3e7;
+      }
+
+      .app-boot-loader {
+        min-height: 100%;
+        display: grid;
+        place-items: center;
+        background:
+          radial-gradient(circle at 20% 15%, rgba(37, 192, 109, 0.13), transparent 30%),
+          linear-gradient(135deg, #eef1f3, #dfe4e8);
+        color: #1f2a37;
+        font-family:
+          Inter, "PingFang SC", "Microsoft YaHei", "Helvetica Neue", Arial, sans-serif;
+      }
+
+      .app-boot-loader__panel {
+        display: grid;
+        justify-items: center;
+        gap: 0;
+      }
+
+      .app-boot-loader__spinner {
+        width: 52px;
+        height: 52px;
+        border: 4px solid rgba(31, 42, 55, 0.16);
+        border-top-color: #25c06d;
+        border-radius: 50%;
+        animation: appBootSpin 0.8s linear infinite;
+      }
+
+      @keyframes appBootSpin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="app">
+      <div class="app-boot-loader" role="status" aria-live="polite" aria-label="正在加载">
+        <div class="app-boot-loader__panel">
+          <div class="app-boot-loader__spinner"></div>
+        </div>
+      </div>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
