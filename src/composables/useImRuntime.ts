@@ -1,6 +1,12 @@
 import { computed, nextTick, onScopeDispose, ref, watch } from 'vue'
 import { layer } from '../services/layer'
 import { playNotificationSound } from '../services/notification'
+import {
+  isCanonicalRealtimeCommand,
+  isCanonicalRealtimeEventPacketValid,
+  isFriendRequestRealtimeEventPacketValid,
+  RealtimeEventDedupWindow
+} from '../services/realtimeEventDedup'
 import type { TenantBrandConfig } from '../services/tenantConfig'
 import { notifyTitleIncomingMessage } from '../services/titleNotifier'
 import { formatImMessageTime, formatImTime, parseImTimestamp } from '../services/time'
@@ -8,15 +14,17 @@ import {
   createMessageGroup as createMessageGroupApi,
   createGroupConversation,
   createVirtualConversation,
+  deriveForwardAsset as deriveForwardAssetApi,
   fetchConversations,
   fetchMessageGroups,
   fetchMessageConfig,
   fetchMessages,
+  getWebDeviceId,
+  issueImChallengeToken,
   markConversationRead as markConversationReadApi,
   mapWebImUser,
   normalizeConversationPreview,
-  refreshImToken,
-  saveWebSession,
+  resolveImAssetUrl,
   searchConversationMessages,
   updateConversationGroup as updateConversationGroupApi,
   updateGroupProfile as updateGroupProfileApi,
@@ -46,6 +54,23 @@ type ImPacket = {
   organization?: number | string
   data?: Record<string, any>
   client_msg_id?: string
+}
+
+type AuthChallengeState = {
+  socket: WebSocket
+  sequence: number
+  clientId: string
+  deviceId: string
+  credentialSessionId: string
+  authSent: boolean
+}
+
+type AuthenticatedConnectionState = {
+  socket: WebSocket
+  clientId: string
+  deviceId: string
+  credentialSessionId: string
+  sessionId: string
 }
 
 type ForwardMode = 'separate' | 'merged'
@@ -82,7 +107,7 @@ function senderDisplayName(sender?: ImMessageSender | null) {
 }
 
 function senderAvatarUrl(sender?: ImMessageSender | null) {
-  return String(sender?.avatar ?? '')
+  return String(sender?.avatar_url ?? '')
 }
 
 function systemNoticeText(content: Record<string, unknown>, currentUserId: string, conversationType: ImConversation['conversationType']) {
@@ -190,7 +215,7 @@ function normalizeMentions(value: unknown): MessageMention[] {
         userId,
         nickname: String(row.nickname ?? row.name ?? ''),
         account: String(row.account ?? ''),
-        avatarUrl: String(row.avatar ?? row.avatar_url ?? row.avatarUrl ?? '')
+        avatarUrl: String(row.avatar_url ?? row.avatarUrl ?? '')
       }
     })
     .filter((item): item is MessageMention => Boolean(item))
@@ -270,13 +295,17 @@ function mapPacketMessage(message: ImPacketMessage, currentSession: WebImSession
   return {
     id: message.client_msg_id || message.message_id || String(message.id),
     messageId: message.message_id,
+    conversationId: message.conversation_id,
+    fileId: String(message.content?.file_id ?? ''),
     sender: senderName,
     avatar: avatarText,
     avatarUrl: isOut ? currentSession.user.avatarUrl : senderAvatarUrl(senderUser) || peerUser?.avatarUrl,
     side: isSystem ? 'system' : (isOut ? 'out' : 'in'),
     type: messageTypeName(Number(message.message_type ?? 1)),
     content: forwardBundle?.title ?? messageText(message, currentUserId, conversation.conversationType),
-    url: String(message.content?.url ?? ''),
+    url: [MESSAGE_TYPE_IMAGE, MESSAGE_TYPE_FILE, MESSAGE_TYPE_VOICE, MESSAGE_TYPE_VIDEO].includes(Number(message.message_type ?? 0))
+      ? ''
+      : String(message.content?.url ?? ''),
     fileName: String(message.content?.name ?? message.content?.file_name ?? ''),
     fileSize: Number(message.content?.size ?? 0),
     messageSeq: Number(message.message_seq ?? 0),
@@ -347,10 +376,23 @@ export function useImRuntime(
   })
 
   let socket: WebSocket | null = null
+  let authChallengeSequence = 0
+  let pendingAuthChallenge: AuthChallengeState | null = null
+  let authenticatedConnection: AuthenticatedConnectionState | null = null
   let pingTimer = 0
   let reconnectTimer = 0
   let localMessageOrder = 0
   let localConversationSortOrder = 0
+  let recentRealtimeEvents: RealtimeEventDedupWindow | null = null
+
+  function realtimeEventWindow() {
+    const organization = String(session().organization ?? '').trim()
+    const userId = String(session().user.userId ?? '').trim()
+    if (!recentRealtimeEvents?.matches(organization, userId)) {
+      recentRealtimeEvents = new RealtimeEventDedupWindow(organization, userId)
+    }
+    return recentRealtimeEvents
+  }
 
   const activeConversation = computed(() => {
     return conversations.value.find((item) => item.id === activeConversationId.value) ?? null
@@ -383,7 +425,6 @@ export function useImRuntime(
   }
 
   async function boot() {
-    await ensureToken()
     await loadMessageConfig()
     await loadMessageGroups()
     await loadConversations()
@@ -587,20 +628,19 @@ export function useImRuntime(
     const current = new WebSocket(wsUrl)
     socket = current
     current.addEventListener('open', () => {
-      logWsStatus('open', { url: wsUrl, readyState: current.readyState })
-      void ensureToken()
-        .then(sendAuth)
-        .catch((error) => {
-          logWsStatus('auth-token-error', {
-            message: error instanceof Error ? error.message : String(error)
-          })
-          layer.error(error instanceof Error ? error.message : 'IM token 刷新失败')
-          closeSocket()
-        })
+      if (socket !== current) return
+      logWsStatus('open:awaiting-auth-challenge', {
+        url: wsUrl,
+        readyState: current.readyState
+      })
     })
-    current.addEventListener('message', handleSocketMessage)
+    current.addEventListener('message', (event) => handleSocketMessage(current, event))
     current.addEventListener('close', (event) => {
       if (socket !== current) return
+      window.clearInterval(pingTimer)
+      pingTimer = 0
+      clearSocketAuthState(current)
+      socket = null
       connectionState.value = 'offline'
       logWsStatus('offline:closed', {
         code: event.code,
@@ -616,27 +656,71 @@ export function useImRuntime(
     })
   }
 
-  function sendAuth() {
-    const imToken = session().imToken
-    if (sendPacket({
-      cmd: 'auth',
-      data: {
-        token: imToken.token,
-        device_id: imToken.deviceId,
-        platform: 'web'
-      }
-    })) {
-      logWsStatus('auth:sent')
-    }
-  }
-
-  async function ensureToken() {
-    const current = session()
-    if (current.imToken?.token && current.imToken.expireAt - 300 > Math.floor(Date.now() / 1000)) {
+  function handleAuthChallenge(current: WebSocket, packet: ImPacket) {
+    if (socket !== current || current.readyState !== WebSocket.OPEN) return
+    if (authenticatedConnection?.socket === current) {
+      failSocketAuthentication(current, 'auth:duplicate-challenge', 'IM 连接重复下发鉴权 challenge')
       return
     }
-    current.imToken = await refreshImToken(config(), current)
-    saveWebSession(current)
+    const clientId =
+      typeof packet.data?.client_id === 'string' ? packet.data.client_id.trim() : ''
+    if (!clientId) {
+      failSocketAuthentication(current, 'auth:invalid-challenge', 'IM 鉴权 challenge 缺少 client_id')
+      return
+    }
+
+    const challenge: AuthChallengeState = {
+      socket: current,
+      sequence: ++authChallengeSequence,
+      clientId,
+      deviceId: getWebDeviceId(),
+      credentialSessionId: '',
+      authSent: false
+    }
+    pendingAuthChallenge = challenge
+    logWsStatus('auth:challenge-received', {
+      clientId,
+      challengeSequence: challenge.sequence
+    })
+    void authenticateChallenge(challenge)
+  }
+
+  async function authenticateChallenge(challenge: AuthChallengeState) {
+    try {
+      const credential = await issueImChallengeToken(config(), session(), challenge.clientId)
+      if (!isCurrentChallenge(challenge)) return
+
+      pendingAuthChallenge = {
+        ...challenge,
+        deviceId: credential.deviceId,
+        credentialSessionId: credential.credentialSessionId,
+        authSent: true
+      }
+      if (
+        !sendPacketToSocket(challenge.socket, {
+          cmd: 'auth',
+          data: {
+            token: credential.token,
+            device_id: credential.deviceId,
+            platform: 'web'
+          }
+        })
+      ) {
+        throw new Error('IM 连接已关闭，无法发送鉴权凭证')
+      }
+      logWsStatus('auth:sent', {
+        clientId: challenge.clientId,
+        challengeSequence: challenge.sequence,
+        expireAt: credential.expireAt
+      })
+    } catch (error) {
+      if (!isCurrentChallenge(challenge)) return
+      failSocketAuthentication(
+        challenge.socket,
+        'auth:credential-error',
+        error instanceof Error ? error.message : 'IM token 签发失败'
+      )
+    }
   }
 
   async function sendText(text: string, replyTo?: Message | null, mentions: MessageMention[] = []) {
@@ -719,6 +803,8 @@ export function useImRuntime(
           ? MESSAGE_TYPE_VIDEO
           : MESSAGE_TYPE_FILE
     updateLocalMessage(conversation.id, clientMsgId, {
+      fileId: uploaded.fileId,
+      conversationId: conversation.conversationId,
       url: uploaded.url,
       fileName: uploaded.name,
       fileSize: uploaded.size,
@@ -727,11 +813,7 @@ export function useImRuntime(
     })
     if (localUrl) URL.revokeObjectURL(localUrl)
     const sent = await sendMessage(type, {
-      url: uploaded.url,
-      name: uploaded.name,
-      size: uploaded.size,
-      mime_type: uploaded.mimeType,
-      extension: uploaded.extension
+      file_id: uploaded.fileId
     }, preview, kind, { clientMsgId, appendLocal: false })
     if (!sent) {
       updateLocalMessage(conversation.id, clientMsgId, {
@@ -747,7 +829,7 @@ export function useImRuntime(
     content: Record<string, unknown>,
     preview: string,
     localType: Message['type'],
-    options: { clientMsgId?: string; appendLocal?: boolean; reply?: MessageQuote | null; mentions?: MessageMention[] } = {}
+    options: { clientMsgId?: string; appendLocal?: boolean; reply?: MessageQuote | null; mentions?: MessageMention[]; localAsset?: UploadedAsset } = {}
   ) {
     const conversation = activeConversation.value
     if (!conversation) return false
@@ -760,14 +842,13 @@ export function useImRuntime(
     content: Record<string, unknown>,
     preview: string,
     localType: Message['type'],
-    options: { clientMsgId?: string; appendLocal?: boolean; reply?: MessageQuote | null; mentions?: MessageMention[] } = {}
+    options: { clientMsgId?: string; appendLocal?: boolean; reply?: MessageQuote | null; mentions?: MessageMention[]; localAsset?: UploadedAsset } = {}
   ) {
     if (!socket || socket.readyState !== WebSocket.OPEN || connectionState.value !== 'connected') {
       layer.warning('IM连接未就绪，稍后再试')
       return false
     }
 
-    await ensureToken()
     const clientMsgId = options.clientMsgId ?? createClientMsgId()
     if (options.appendLocal !== false) {
       appendMessage(conversation.id, {
@@ -778,16 +859,22 @@ export function useImRuntime(
         side: 'out',
         type: localType,
         content: preview,
-        url: String(content.url ?? ''),
-        fileName: String(content.name ?? ''),
-        fileSize: Number(content.size ?? 0),
+        conversationId: conversation.conversationId,
+        fileId: String(content.file_id ?? ''),
+        url: options.localAsset?.url ?? String(content.url ?? ''),
+        fileName: options.localAsset?.name ?? String(content.name ?? ''),
+        fileSize: options.localAsset?.size ?? Number(content.size ?? 0),
         createTime: new Date().toISOString(),
         time: formatImTime(),
         state: 'sent',
         senderUserId: session().user.userId,
         quote: options.reply ?? null,
         mentions: options.mentions ?? [],
-        meta: content.size ? formatFileSize(Number(content.size)) : undefined
+        meta: options.localAsset
+          ? formatFileSize(options.localAsset.size)
+          : content.size
+            ? formatFileSize(Number(content.size))
+            : undefined
       })
     } else {
       updateLocalMessage(conversation.id, clientMsgId, {
@@ -812,7 +899,7 @@ export function useImRuntime(
     return true
   }
 
-  function forwardContent(message: Message) {
+  async function forwardContent(message: Message) {
     if (message.forwardBundle) {
       return {
         messageType: MESSAGE_TYPE_TEXT,
@@ -827,52 +914,32 @@ export function useImRuntime(
         localType: 'text' as const
       }
     }
-    if (message.type === 'image') {
-      return {
-        messageType: MESSAGE_TYPE_IMAGE,
-        content: {
-          url: message.url ?? '',
-          name: message.fileName || message.content || '图片',
-          size: message.fileSize ?? 0
-        },
-        preview: '[图片]',
-        localType: 'image' as const
+    if (['image', 'file', 'voice', 'video'].includes(message.type)) {
+      if (!message.fileId || !message.messageId || !message.conversationId) {
+        throw new Error('原附件消息缺少可信转发上下文')
       }
-    }
-    if (message.type === 'file') {
+      const kind = message.type as UploadedAsset['kind']
+      const asset = await deriveForwardAssetApi(config(), session(), {
+        conversationId: message.conversationId,
+        messageId: message.messageId,
+        fileId: message.fileId,
+        kind
+      })
+      const messageType = kind === 'image'
+        ? MESSAGE_TYPE_IMAGE
+        : kind === 'voice'
+          ? MESSAGE_TYPE_VOICE
+          : kind === 'video'
+            ? MESSAGE_TYPE_VIDEO
+            : MESSAGE_TYPE_FILE
       return {
-        messageType: MESSAGE_TYPE_FILE,
+        messageType,
         content: {
-          url: message.url ?? '',
-          name: message.fileName || message.content || '文件',
-          size: message.fileSize ?? 0
+          file_id: asset.fileId
         },
-        preview: '[文件]',
-        localType: 'file' as const
-      }
-    }
-    if (message.type === 'voice') {
-      return {
-        messageType: MESSAGE_TYPE_VOICE,
-        content: {
-          url: message.url ?? '',
-          name: message.fileName || message.content || '语音',
-          size: message.fileSize ?? 0
-        },
-        preview: '[语音]',
-        localType: 'voice' as const
-      }
-    }
-    if (message.type === 'video') {
-      return {
-        messageType: MESSAGE_TYPE_VIDEO,
-        content: {
-          url: message.url ?? '',
-          name: message.fileName || message.content || '视频',
-          size: message.fileSize ?? 0
-        },
-        preview: '[视频]',
-        localType: 'video' as const
+        preview: assetPreview(kind),
+        localType: kind,
+        localAsset: asset
       }
     }
 
@@ -890,7 +957,9 @@ export function useImRuntime(
       time: item.time ?? '',
       type: item.type,
       content: item.content,
-      url: item.url || undefined,
+      // Private signed URLs are display credentials and must never be persisted
+      // inside merged-forward message bodies.
+      url: undefined,
       file_name: item.fileName || undefined,
       size: item.fileSize ? Number(item.fileSize) : undefined,
       forward_bundle: item.forwardBundle
@@ -910,7 +979,7 @@ export function useImRuntime(
       time: message.time ?? '',
       type: message.type,
       content: messageContentPreview(message),
-      url: message.url ?? '',
+      url: '',
       fileName: message.fileName ?? '',
       fileSize: message.fileSize ?? 0,
       forwardBundle: message.forwardBundle ?? null
@@ -940,6 +1009,18 @@ export function useImRuntime(
       return false
     }
 
+    let separatePayloads: Awaited<ReturnType<typeof forwardContent>>[] = []
+    if (mode === 'separate') {
+      try {
+        for (const message of list) {
+          separatePayloads.push(await forwardContent(message))
+        }
+      } catch (error) {
+        layer.error(error instanceof Error ? error.message : '附件转发授权失败')
+        return false
+      }
+    }
+
     for (const conversation of targetConversations) {
       if (mode === 'merged') {
         const items = mergedForwardItems(list)
@@ -959,19 +1040,45 @@ export function useImRuntime(
         continue
       }
 
-      for (const message of list) {
-        const payload = forwardContent(message)
+      for (const payload of separatePayloads) {
         await sendMessageToConversation(
           conversation,
           payload.messageType,
           payload.content,
           payload.preview,
-          payload.localType
+          payload.localType,
+          { localAsset: 'localAsset' in payload ? payload.localAsset : undefined }
         )
       }
     }
     layer.success(targetConversations.length > 1 ? `已转发到 ${targetConversations.length} 个会话` : '已转发')
     return true
+  }
+
+  async function resolveMessageAssetUrl(message: Message, force = false) {
+    if (!['image', 'file', 'voice', 'video'].includes(message.type) || !message.fileId) {
+      throw new Error('消息不包含可信附件')
+    }
+    const needsMessageProof = message.side !== 'out'
+    if (needsMessageProof && (!message.conversationId || !message.messageId)) {
+      throw new Error('附件消息缺少可见性上下文')
+    }
+    const url = await resolveImAssetUrl(
+      config(),
+      session(),
+      {
+        fileId: message.fileId,
+        ...(needsMessageProof
+          ? { conversationId: message.conversationId, messageId: message.messageId }
+          : {})
+      },
+      force
+    )
+    if (message.conversationId) {
+      updateLocalMessage(message.conversationId, message.id, { url })
+    }
+
+    return url
   }
 
   async function recallMessage(message: Message) {
@@ -1078,7 +1185,8 @@ export function useImRuntime(
     return true
   }
 
-  function handleSocketMessage(event: MessageEvent<string>) {
+  function handleSocketMessage(current: WebSocket, event: MessageEvent<string>) {
+    if (socket !== current) return
     let packet: ImPacket | null = null
     try {
       packet = JSON.parse(event.data) as ImPacket
@@ -1088,22 +1196,92 @@ export function useImRuntime(
     if (!packet) return
 
     if (packet.cmd === 'auth') {
-      sendAuth()
+      handleAuthChallenge(current, packet)
+      return
+    }
+    if (packet.cmd === 'auth_ack') {
+      handleAuthAck(current, packet)
+      return
+    }
+    if (packet.cmd === 'error' && connectionState.value !== 'connected') {
+      const message = String(packet.data?.msg ?? 'IM 鉴权失败')
+      failSocketAuthentication(current, 'auth:error-packet', message)
+      return
+    }
+    if (
+      connectionState.value !== 'connected' ||
+      authenticatedConnection?.socket !== current
+    ) {
+      failSocketAuthentication(
+        current,
+        'auth:packet-before-ack',
+        'IM 连接在 AUTH_ACK 前返回了业务数据'
+      )
       return
     }
     if (packet.cmd !== 'error' && String(packet.organization ?? '') !== session().organization) {
       logWsStatus('error:organization-mismatch', { packetOrganization: packet.organization ?? null })
-      connectionState.value = 'error'
-      layer.error('IM 响应 organization 与认证会话不一致')
-      closeSocket()
+      failSocketAuthentication(
+        current,
+        'protocol:organization-mismatch',
+        'IM 响应 organization 与认证会话不一致'
+      )
       return
     }
-    if (packet.cmd === 'auth_ack') {
-      connectionState.value = 'connected'
-      logWsStatus('connected:auth-ack')
-      startPing()
-      void loadConversations()
-      return
+    if (packet.cmd === 'friend_request') {
+      if (!isFriendRequestRealtimeEventPacketValid(
+        packet,
+        session().organization,
+        session().user.userId
+      )) {
+        failSocketAuthentication(
+          current,
+          'protocol:invalid-friend-request-event',
+          '好友申请实时事件协议或幂等标识无效'
+        )
+        return
+      }
+      const realtimeEventId = packet.data?.event_id
+      const observation = realtimeEventWindow().observe(realtimeEventId)
+      if (observation === 'duplicate') {
+        logWsStatus('realtime:friend-request-duplicate-skipped', { eventId: realtimeEventId })
+        return
+      }
+      if (observation !== 'new') {
+        failSocketAuthentication(
+          current,
+          'protocol:invalid-friend-request-event',
+          '好友申请实时事件幂等标识无效'
+        )
+        return
+      }
+    }
+    if (isCanonicalRealtimeCommand(packet.cmd)) {
+      // Canonical Rabbit events are state-changing broadcasts. Missing or
+      // malformed event ids and schemas fail closed before any local mutation;
+      // ACK/SYNC and other point-to-point commands are not subject to this gate.
+      if (!isCanonicalRealtimeEventPacketValid(packet, session().organization)) {
+        failSocketAuthentication(
+          current,
+          'protocol:invalid-event-id',
+          'IM 实时事件协议或幂等标识无效'
+        )
+        return
+      }
+      const realtimeEventId = packet.data?.event_id
+      const observation = realtimeEventWindow().observe(realtimeEventId)
+      if (observation === 'duplicate') {
+        logWsStatus('realtime:duplicate-skipped', { eventId: realtimeEventId })
+        return
+      }
+      if (observation !== 'new') {
+        failSocketAuthentication(
+          current,
+          'protocol:invalid-event-id',
+          'IM 实时事件幂等标识无效'
+        )
+        return
+      }
     }
     if (packet.cmd === 'send_ack') {
       const message = packet.data?.message as ImPacketMessage | undefined
@@ -1162,6 +1340,61 @@ export function useImRuntime(
     if (packet.cmd === 'error') {
       handleErrorPacket(packet)
     }
+  }
+
+  function handleAuthAck(current: WebSocket, packet: ImPacket) {
+    const challenge = pendingAuthChallenge
+    const data = packet.data ?? {}
+    const clientId = typeof data.client_id === 'string' ? data.client_id.trim() : ''
+    const deviceId = typeof data.device_id === 'string' ? data.device_id.trim() : ''
+    const credentialSessionId =
+      typeof data.credential_session_id === 'string' ? data.credential_session_id.trim() : ''
+    const sessionId = typeof data.session_id === 'string' ? data.session_id.trim() : ''
+    const valid = Boolean(
+      challenge &&
+        challenge.socket === current &&
+        challenge.authSent &&
+        socket === current &&
+        current.readyState === WebSocket.OPEN &&
+        data.ok === true &&
+        String(packet.organization ?? '') === session().organization &&
+        clientId === challenge.clientId &&
+        deviceId === challenge.deviceId &&
+        credentialSessionId !== '' &&
+        credentialSessionId === challenge.credentialSessionId &&
+        sessionId !== ''
+    )
+    if (!valid || !challenge) {
+      logWsStatus('auth-ack:invalid', {
+        packetOrganization: packet.organization ?? null,
+        clientId,
+        challengeClientId: challenge?.clientId ?? '',
+        hasCredentialSessionId: credentialSessionId !== '',
+        hasSessionId: sessionId !== ''
+      })
+      failSocketAuthentication(
+        current,
+        'auth-ack:rejected',
+        'IM AUTH_ACK 与当前机构、设备或连接 challenge 不一致'
+      )
+      return
+    }
+
+    authenticatedConnection = {
+      socket: current,
+      clientId,
+      deviceId,
+      credentialSessionId,
+      sessionId
+    }
+    pendingAuthChallenge = null
+    connectionState.value = 'connected'
+    logWsStatus('connected:auth-ack', {
+      clientId,
+      sessionId
+    })
+    startPing()
+    void loadConversations()
   }
 
   function handleErrorPacket(packet: ImPacket) {
@@ -1436,7 +1669,15 @@ export function useImRuntime(
     ))
   }
 
-  async function updateGroupProfile(conversationId: string, profile: { title?: string; avatar?: string; description?: string; notifyAll?: boolean }) {
+  async function updateGroupProfile(
+    conversationId: string,
+    profile: {
+      title?: string
+      avatarFileId?: string
+      description?: string
+      notifyAll?: boolean
+    }
+  ) {
     const conversation = conversations.value.find((item) => item.id === conversationId)
     if (!conversation || conversation.virtual || !conversation.conversationId || conversation.conversationType !== 'group') {
       layer.warning('请选择群聊')
@@ -1454,6 +1695,8 @@ export function useImRuntime(
             ...item,
             title: updated.title,
             avatar: updated.avatar,
+            avatarFileId: updated.avatarFileId,
+            avatarExpiresAt: updated.avatarExpiresAt,
             description: updated.description,
             avatarMembers: updated.avatarMembers,
             preview: updated.preview,
@@ -1552,10 +1795,50 @@ export function useImRuntime(
     return document.hidden || !document.hasFocus()
   }
 
-  function sendPacket(packet: ImPacket) {
-    if (!socket || socket.readyState !== WebSocket.OPEN) return false
-    socket.send(JSON.stringify({ ...packet, ts: Date.now() }))
+  function sendPacketToSocket(target: WebSocket, packet: ImPacket) {
+    if (target.readyState !== WebSocket.OPEN) return false
+    target.send(JSON.stringify({ ...packet, ts: Date.now() }))
     return true
+  }
+
+  function sendPacket(packet: ImPacket) {
+    const current = socket
+    if (
+      !current ||
+      current.readyState !== WebSocket.OPEN ||
+      connectionState.value !== 'connected' ||
+      authenticatedConnection?.socket !== current
+    ) {
+      return false
+    }
+    return sendPacketToSocket(current, packet)
+  }
+
+  function isCurrentChallenge(challenge: AuthChallengeState) {
+    return Boolean(
+      socket === challenge.socket &&
+        challenge.socket.readyState === WebSocket.OPEN &&
+        pendingAuthChallenge?.socket === challenge.socket &&
+        pendingAuthChallenge.sequence === challenge.sequence &&
+        pendingAuthChallenge.clientId === challenge.clientId
+    )
+  }
+
+  function clearSocketAuthState(target?: WebSocket) {
+    if (!target || pendingAuthChallenge?.socket === target) {
+      pendingAuthChallenge = null
+    }
+    if (!target || authenticatedConnection?.socket === target) {
+      authenticatedConnection = null
+    }
+  }
+
+  function failSocketAuthentication(target: WebSocket, status: string, message: string) {
+    if (socket !== target) return
+    logWsStatus(status, { message })
+    connectionState.value = 'error'
+    layer.error(message)
+    closeSocket()
   }
 
   function startPing() {
@@ -1571,16 +1854,22 @@ export function useImRuntime(
   function scheduleReconnect() {
     clearReconnect()
     logWsStatus('reconnect:scheduled', { delay: 3000 })
-    reconnectTimer = window.setTimeout(connect, 3000)
+    reconnectTimer = window.setTimeout(() => {
+      reconnectTimer = 0
+      connect()
+    }, 3000)
   }
 
   function clearReconnect() {
     window.clearTimeout(reconnectTimer)
+    reconnectTimer = 0
   }
 
   function closeSocket() {
     clearReconnect()
     window.clearInterval(pingTimer)
+    pingTimer = 0
+    clearSocketAuthState()
     if (socket) {
       const current = socket
       socket = null
@@ -1645,6 +1934,7 @@ export function useImRuntime(
     deleteMessage,
     deleteMessages,
     forwardMessages,
+    resolveMessageAssetUrl,
     updateConversationSetting,
     updateGroupProfile,
     searchActiveMessages,

@@ -21,6 +21,7 @@ export interface ClientModuleProjection {
   available: boolean
   capabilities: string[]
   permissions: string[]
+  config: Record<string, unknown>
 }
 
 export interface ClientTabbarItem {
@@ -98,12 +99,14 @@ function parseClientConfig(
     }
     const capabilities = readStringArray(item.capabilities)
     const permissions = readStringArray(item.permissions)
+    const config = item.config
     if (
       typeof item.version !== 'string' ||
       !item.version.trim() ||
       typeof item.available !== 'boolean' ||
       !capabilities ||
-      !permissions
+      !permissions ||
+      !isRecord(config)
     ) {
       console.warn(`[b8im] ignore malformed module projection: ${moduleKey}`)
       return
@@ -113,7 +116,8 @@ function parseClientConfig(
       version: item.version.trim(),
       available: item.available,
       capabilities,
-      permissions
+      permissions,
+      config: { ...config }
     })
     seenModules.add(moduleKey)
   })
@@ -132,6 +136,13 @@ function parseClientConfig(
   })
 
   return { version, organization, deploymentId, features, modules, tabbar }
+}
+
+export function clientModuleConfig(
+  config: WebClientConfig | null,
+  moduleKey: ClientModuleKey
+): Record<string, unknown> {
+  return config?.modules.find((item) => item.moduleKey === moduleKey)?.config ?? {}
 }
 
 export async function fetchWebClientConfig(

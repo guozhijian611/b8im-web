@@ -38,6 +38,10 @@ type MediaPreviewState = {
   url: string
   title: string
 }
+type AssetVisibilityElement = HTMLElement & {
+  __b8imAssetObserver?: IntersectionObserver
+  __b8imAssetKey?: string
+}
 type TextMessagePart = {
   text: string
   mention: boolean
@@ -72,7 +76,46 @@ const props = defineProps<{
   loadOlderMessages: () => Promise<boolean>
   canDeleteSelf: boolean
   canDeleteBoth: boolean
+  resolveAssetUrl: (message: Message, force?: boolean) => Promise<string>
 }>()
+
+function observePrivateAsset(element: AssetVisibilityElement, message: Message) {
+  element.__b8imAssetObserver?.disconnect()
+  element.__b8imAssetObserver = undefined
+  const assetKey = `${message.conversationId ?? ''}:${message.messageId ?? ''}:${message.fileId ?? ''}`
+  element.__b8imAssetKey = assetKey
+  if (!message.fileId || message.url || !['image', 'file', 'voice', 'video'].includes(message.type)) return
+
+  const resolve = () => {
+    if (element.__b8imAssetKey !== assetKey) return
+    element.__b8imAssetObserver?.disconnect()
+    element.__b8imAssetObserver = undefined
+    void props.resolveAssetUrl(message).catch((error) => {
+      console.warn('[b8im:asset] visible URL resolution failed', error)
+    })
+  }
+  if (typeof IntersectionObserver === 'undefined') {
+    resolve()
+    return
+  }
+  const observer = new IntersectionObserver((entries) => {
+    if (entries.some((entry) => entry.isIntersecting)) resolve()
+  }, { rootMargin: '120px' })
+  element.__b8imAssetObserver = observer
+  observer.observe(element)
+}
+
+const vAssetVisible = {
+  mounted(element: AssetVisibilityElement, binding: { value: Message }) {
+    observePrivateAsset(element, binding.value)
+  },
+  updated(element: AssetVisibilityElement, binding: { value: Message }) {
+    observePrivateAsset(element, binding.value)
+  },
+  beforeUnmount(element: AssetVisibilityElement) {
+    element.__b8imAssetObserver?.disconnect()
+  }
+}
 
 const emit = defineEmits<{
   'toggle-info': []
@@ -541,7 +584,7 @@ function canForwardMessage(message: Message) {
   if (!message.messageId) return false
   if (message.type === 'notice') return false
   if (message.type === 'text') return Boolean(message.content.trim())
-  return Boolean(message.url)
+  return Boolean(message.fileId && message.messageId && message.conversationId)
 }
 
 function getVoicePlayback(id: string): VoicePlaybackState {
@@ -575,9 +618,22 @@ function syncVoicePlayback(id: string, audio: HTMLAudioElement) {
   })
 }
 
-async function toggleVoicePlayback(id: string) {
+async function toggleVoicePlayback(message: Message) {
+  let url = ''
+  try {
+    url = await props.resolveAssetUrl(message)
+  } catch (error) {
+    layer.warning(error instanceof Error ? error.message : '语音访问授权失败')
+    return
+  }
+  await nextTick()
+  const id = message.id
   const audio = voiceAudioElements.get(id)
   if (!audio) return
+  if (audio.src !== url) {
+    audio.src = url
+    audio.load()
+  }
 
   if (!audio.paused) {
     audio.pause()
@@ -610,14 +666,42 @@ function formatVoiceTime(seconds: number) {
   return `${minutes}:${String(restSeconds).padStart(2, '0')}`
 }
 
-function openMediaPreview(message: Message, type: 'image' | 'video') {
-  if (!message.url) return
+async function openMediaPreview(message: Message, type: 'image' | 'video') {
+  let url = ''
+  try {
+    url = await props.resolveAssetUrl(message)
+  } catch (error) {
+    layer.warning(error instanceof Error ? error.message : '附件访问授权失败')
+    return
+  }
   mediaPreview.value = {
     visible: true,
     type,
-    url: message.url,
+    url,
     title: message.fileName || (type === 'image' ? '图片' : '视频')
   }
+}
+
+async function openPrivateAsset(message: Message) {
+  const target = window.open('about:blank', '_blank')
+  if (target) target.opener = null
+  try {
+    const url = await props.resolveAssetUrl(message)
+    if (target) {
+      target.location.replace(url)
+    } else {
+      window.location.assign(url)
+    }
+  } catch (error) {
+    target?.close()
+    layer.warning(error instanceof Error ? error.message : '附件访问授权失败')
+  }
+}
+
+function refreshPrivateAsset(message: Message) {
+  void props.resolveAssetUrl(message, true).catch((error) => {
+    console.warn('[b8im:asset] URL refresh failed', error)
+  })
 }
 
 function closeMediaPreview() {
@@ -1227,6 +1311,7 @@ onBeforeUnmount(() => {
         </div>
         <article
           v-for="message in messages"
+          v-asset-visible="message"
           :key="message.id"
           :data-message-id="message.id"
           class="message-line"
@@ -1305,7 +1390,11 @@ onBeforeUnmount(() => {
                     :aria-label="`查看图片：${message.fileName || message.content || '图片'}`"
                     @click.stop="openMediaPreview(message, 'image')"
                   >
-                    <img :src="message.url" :alt="message.fileName || message.content" />
+                    <img
+                      :src="message.url"
+                      :alt="message.fileName || message.content"
+                      @error="refreshPrivateAsset(message)"
+                    />
                   </button>
                   <span v-else class="image-thumb">IMG</span>
                   <div v-if="message.state === 'uploading'" class="upload-progress">
@@ -1315,7 +1404,13 @@ onBeforeUnmount(() => {
                 <div v-else-if="message.type === 'file'" class="file-message">
                   <FilePlus2 :size="24" />
                   <span>
-                    <a v-if="message.url" :href="message.url" target="_blank" rel="noreferrer">
+                    <a
+                      v-if="message.url"
+                      :href="message.url"
+                      target="_blank"
+                      rel="noreferrer"
+                      @click.prevent.stop="openPrivateAsset(message)"
+                    >
                       {{ message.fileName || '打开文件' }}
                     </a>
                     <strong v-else>{{ message.fileName || '文件' }}</strong>
@@ -1333,7 +1428,13 @@ onBeforeUnmount(() => {
                     :aria-label="`查看视频：${message.fileName || '视频'}`"
                     @click.stop="openMediaPreview(message, 'video')"
                   >
-                    <video :src="message.url" muted preload="metadata" playsinline></video>
+                    <video
+                      :src="message.url"
+                      muted
+                      preload="metadata"
+                      playsinline
+                      @error="refreshPrivateAsset(message)"
+                    ></video>
                     <span class="video-preview-play">
                       <Play :size="20" />
                     </span>
@@ -1358,6 +1459,7 @@ onBeforeUnmount(() => {
                         class="voice-native-audio"
                         :src="message.url"
                         preload="metadata"
+                        @error="refreshPrivateAsset(message)"
                         @loadedmetadata="syncVoicePlayback(message.id, $event.currentTarget as HTMLAudioElement)"
                         @timeupdate="syncVoicePlayback(message.id, $event.currentTarget as HTMLAudioElement)"
                         @play="syncVoicePlayback(message.id, $event.currentTarget as HTMLAudioElement)"
@@ -1365,7 +1467,7 @@ onBeforeUnmount(() => {
                         @ended="syncVoicePlayback(message.id, $event.currentTarget as HTMLAudioElement)"
                       ></audio>
                       <span class="voice-control">
-                        <button type="button" title="播放语音" @click.stop="toggleVoicePlayback(message.id)">
+                        <button type="button" title="播放语音" @click.stop="toggleVoicePlayback(message)">
                           <Pause v-if="getVoicePlayback(message.id).playing" :size="14" />
                           <Play v-else :size="14" />
                         </button>

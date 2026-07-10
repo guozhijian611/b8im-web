@@ -23,19 +23,15 @@ export interface Conversation {
 
 export type ImConnectionState = 'idle' | 'connecting' | 'connected' | 'offline' | 'error'
 
-export interface ImTokenInfo {
-  token: string
-  expireAt: number
-  deviceId: string
-}
-
 export interface WebImUser {
   id: string
   userId: string
   account: string
   nickname: string
   signature: string
+  avatarFileId: string
   avatarUrl: string
+  avatarExpiresAt: number
   mobile: string
   imShortNo: string
   gender: number
@@ -54,7 +50,9 @@ export interface ImMessageSender {
   account?: string
   nickname?: string
   signature?: string
-  avatar?: string
+  avatar_file_id?: string
+  avatar_url?: string
+  avatar_expires_at?: number
   mobile?: string
   im_short_no?: string
   gender?: number
@@ -74,7 +72,6 @@ export interface WebImSession {
   deploymentId: string
   apiServerUrl: string
   imServerUrl: string
-  imToken: ImTokenInfo
   user: WebImUser
 }
 
@@ -106,6 +103,8 @@ export interface ImConversation {
   conversationType: 'single' | 'group'
   title: string
   avatar: string
+  avatarFileId: string
+  avatarExpiresAt: number
   description: string
   avatarMembers: AvatarMember[]
   peerUserId: string
@@ -213,6 +212,8 @@ export interface FriendRequestPushEvent {
 export interface Message {
   id: string
   messageId?: string
+  conversationId?: string
+  fileId?: string
   sender: string
   avatar: string
   avatarUrl?: string
@@ -243,7 +244,9 @@ export interface Contact {
   account: string
   name: string
   avatar: string
+  avatarFileId: string
   avatarUrl: string
+  avatarExpiresAt: number
   title: string
   status: string
   online: boolean
@@ -272,6 +275,7 @@ export interface GroupMember {
 }
 
 export interface UploadedAsset {
+  fileId: string
   kind: 'image' | 'file' | 'voice' | 'video'
   name: string
   url: string

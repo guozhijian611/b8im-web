@@ -4844,6 +4844,33 @@ button {
   overflow-wrap: anywhere;
 }
 
+.announcement-detail__ack {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 28px;
+}
+
+.announcement-detail__ack button {
+  padding: 10px 18px;
+  border: 0;
+  border-radius: 10px;
+  background: var(--green);
+  color: #fff;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.announcement-detail__ack button:disabled {
+  cursor: default;
+  opacity: .65;
+}
+
+.announcement-detail__ack span {
+  color: #dc2626;
+  font-size: 13px;
+}
+
 .agreement-page__content {
   white-space: pre-wrap;
   overflow-wrap: anywhere;

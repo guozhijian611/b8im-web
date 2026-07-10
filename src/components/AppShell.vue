@@ -6,6 +6,7 @@ import {
   MessageCircle
 } from '@lucide/vue'
 import AnnouncementView from './AnnouncementView.vue'
+import AnnouncementPopup from './AnnouncementPopup.vue'
 import AvatarCropDialog from './AvatarCropDialog.vue'
 import ChatWindow from './ChatWindow.vue'
 import ContactsView from './ContactsView.vue'
@@ -128,6 +129,7 @@ const {
   deleteMessage,
   deleteMessages,
   forwardMessages,
+  resolveMessageAssetUrl,
   updateConversationSetting,
   updateGroupProfile,
   searchActiveMessages,
@@ -160,6 +162,13 @@ const railItems = computed<RailItem[]>(() => {
   }
   return items
 })
+
+const announcementAvailable = computed(() => isClientModuleAvailable(props.clientConfig, 'announcement'))
+const announcementPopupKey = computed(() => [
+  props.webSession.organization,
+  props.webSession.user.userId,
+  props.clientConfig?.version ?? 0
+].join(':'))
 
 function normalizeWatermarkSettings(value: Partial<WatermarkSettings>): WatermarkSettings {
   const opacity = Number(value.opacity)
@@ -515,7 +524,7 @@ async function handleSaveAvatar(file: File) {
   avatarSaving.value = true
   try {
     const asset = await uploadImAsset(props.tenantConfig, props.webSession, file, 'image')
-    const user = await updateWebAvatar(props.tenantConfig, props.webSession, asset.url)
+    const user = await updateWebAvatar(props.tenantConfig, props.webSession, asset.fileId)
     emit('session-updated', {
       ...props.webSession,
       user
@@ -555,7 +564,7 @@ async function handleUpdateGroupAvatar(file: File) {
     const asset = await uploadImAsset(props.tenantConfig, props.webSession, file, 'image', {
       conversationType: 'group'
     })
-    await updateGroupProfile(conversation.id, { avatar: asset.url })
+    await updateGroupProfile(conversation.id, { avatarFileId: asset.fileId })
     layer.success('群头像已更新')
   } catch (error) {
     layer.error(error instanceof Error ? error.message : '群头像更新失败')
@@ -683,6 +692,12 @@ watch(
 
 <template>
   <div class="app-frame" :class="{ 'info-open': showInfo, resizing: isConversationResizing }" :style="appFrameStyle">
+    <AnnouncementPopup
+      v-if="announcementAvailable"
+      :key="announcementPopupKey"
+      :tenant-config="tenantConfig"
+      :web-session="webSession"
+    />
     <SideRail
       :items="railItems"
       :active-view="activeView"
@@ -737,6 +752,7 @@ watch(
         :load-older-messages="loadOlderActiveMessages"
         :can-delete-self="messageDeleteConfig.deleteSingleEnabled"
         :can-delete-both="messageDeleteConfig.deleteBothEnabled"
+        :resolve-asset-url="resolveMessageAssetUrl"
         @toggle-info="showInfo = !showInfo"
         @send-text="sendText"
         @send-asset="sendAsset"

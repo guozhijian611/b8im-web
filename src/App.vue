@@ -9,6 +9,7 @@ import LoginView from './components/LoginView.vue'
 import StatePanel from './components/StatePanel.vue'
 import UnsupportedClientView from './components/UnsupportedClientView.vue'
 import { detectWebClientEnvironment } from './services/clientEnvironment'
+import { CLIENT_CONFIG_INVALIDATED_EVENT } from './services/clientConfigEvents'
 import { WebApiError } from './services/apiClient'
 import {
   CLIENT_MODULE_REGISTRY,
@@ -317,6 +318,16 @@ function refreshClientConfigWhenVisible() {
   }
 }
 
+async function handleClientConfigInvalidated() {
+  if (!isAuthed.value || isClientConfigLoading.value) return
+  await loadClientConfig()
+  if (route.value.kind === 'view'
+    && route.value.view === 'announcement'
+    && !announcementAvailable.value) {
+    navigateToView('chats')
+  }
+}
+
 onMounted(() => {
   window.addEventListener('hashchange', syncRoute)
   window.addEventListener('popstate', syncRoute)
@@ -326,6 +337,7 @@ onMounted(() => {
   window.addEventListener('blur', closeAppContextMenu)
   document.addEventListener('visibilitychange', refreshClientConfigWhenVisible)
   window.addEventListener(CONTEXT_MENU_CLOSE_EVENT, handleContextMenuClose)
+  window.addEventListener(CLIENT_CONFIG_INVALIDATED_EVENT, handleClientConfigInvalidated)
   syncRoute()
   void bootstrap()
 })
@@ -340,6 +352,7 @@ onBeforeUnmount(() => {
   window.removeEventListener('blur', closeAppContextMenu)
   document.removeEventListener('visibilitychange', refreshClientConfigWhenVisible)
   window.removeEventListener(CONTEXT_MENU_CLOSE_EVENT, handleContextMenuClose)
+  window.removeEventListener(CLIENT_CONFIG_INVALIDATED_EVENT, handleClientConfigInvalidated)
 })
 </script>
 

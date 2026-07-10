@@ -4,7 +4,6 @@ import type {
   FriendRequest,
   ImConversation,
   ImPacketMessage,
-  ImTokenInfo,
   GroupMember,
   MessageGroup,
   UploadedAsset,
@@ -21,7 +20,9 @@ interface WebImUserPayload {
   account?: string
   nickname?: string
   signature?: string
-  avatar?: string
+  avatar_file_id?: string
+  avatar_url?: string
+  avatar_expires_at?: number
   mobile?: string
   im_short_no?: string
   gender?: number
@@ -42,14 +43,19 @@ interface WebImLoginPayload {
     access_token?: string
     refresh_token?: string
   }
-  im_token?: ImTokenPayload
   user: WebImUserPayload
 }
 
-interface ImTokenPayload {
+interface ImTokenResponse {
   token?: string
-  expire_at?: number
-  device_id?: string
+}
+
+export interface ImChallengeCredential {
+  token: string
+  expireAt: number
+  deviceId: string
+  clientId: string
+  credentialSessionId: string
 }
 
 type UploadProgressHandler = (progress: number) => void
@@ -59,7 +65,9 @@ interface ConversationPayload {
   conversation_sort_id?: number | string
   conversation_type?: number
   title?: string
-  avatar?: string
+  avatar_file_id?: string
+  avatar_url?: string
+  avatar_expires_at?: number
   description?: string
   avatar_members?: WebImUserPayload[]
   peer_user?: WebImUserPayload | null
@@ -95,27 +103,33 @@ interface UpdateGroupProfilePayload extends ConversationPayload {
 }
 
 interface UploadedAssetPayload {
+  file_id: string
   kind: UploadedAsset['kind']
   name: string
-  url: string
   size: number
   mime_type: string
   extension: string
 }
 
+interface AssetUrlPayload {
+  file_id: string
+  url: string
+  expires_at: number
+}
+
+interface CachedAssetUrl {
+  url: string
+  expiresAt: number
+}
+
 interface PrepareUploadPayload {
-  mode: 'direct' | 'proxy'
-  provider?: 's3' | 'cos'
-  method?: 'PUT' | 'POST'
-  upload_url: string
-  headers?: Record<string, string>
-  object_key?: string
-  public_url?: string
+  mode: 'proxy'
+  method: 'POST'
+  upload_path: string
   filename?: string
   size?: number
   mime_type?: string
   extension?: string
-  expires_at?: number
 }
 
 export interface MessageConfig {
@@ -142,6 +156,8 @@ interface FriendRequestPayload {
 
 const WINDOW_STORAGE_KEY = 'b8im_web_window_session'
 const LOCAL_RESOURCE_HOSTS = new Set(['127.0.0.1', 'localhost', '::1', '[::1]'])
+const PRIVATE_ASSET_CACHE_SKEW_SECONDS = 30
+const privateAssetUrlCache = new Map<string, CachedAssetUrl>()
 
 const firstText = (value: string) => (value.trim().slice(0, 1) || '用').toUpperCase()
 
@@ -156,45 +172,95 @@ const createRuntimeDeviceId = () => {
 
 const runtimeDeviceId = createRuntimeDeviceId()
 
-const mapImToken = (payload?: ImTokenPayload): ImTokenInfo => ({
-  token: String(payload?.token ?? ''),
-  expireAt: Number(payload?.expire_at ?? 0),
-  deviceId: String(payload?.device_id ?? '')
-})
-
 function decodeJwtPayload(token: string): Record<string, unknown> {
-  const encoded = token.split('.')[1]
-  if (!encoded) throw new Error('凭证格式无效')
+  const parts = token.split('.')
+  if (parts.length !== 3 || parts.some((part) => part === '')) throw new Error('凭证格式无效')
+  const encoded = parts[1]
   const normalized = encoded.replace(/-/g, '+').replace(/_/g, '/')
   const padded = normalized.padEnd(Math.ceil(normalized.length / 4) * 4, '=')
   const bytes = Uint8Array.from(atob(padded), (character) => character.charCodeAt(0))
   return JSON.parse(new TextDecoder().decode(bytes)) as Record<string, unknown>
 }
 
-function assertJwtContext(
-  token: string,
-  config: TenantBrandConfig,
-  audience: 'web-api' | 'im',
-  deviceId = ''
-) {
+function jwtAudiences(value: unknown): string[] {
+  if (typeof value === 'string' && value.trim()) return [value.trim()]
+  if (
+    Array.isArray(value) &&
+    value.length > 0 &&
+    value.every((item) => typeof item === 'string' && item.trim())
+  ) {
+    return value.map((item) => item.trim())
+  }
+  return []
+}
+
+function assertWebApiJwtContext(token: string, config: TenantBrandConfig) {
   const payload = decodeJwtPayload(token)
-  const audiences = Array.isArray(payload.aud) ? payload.aud.map(String) : [String(payload.aud ?? '')]
+  const audiences = jwtAudiences(payload.aud)
   const expiresAt = Number(payload.exp ?? 0)
   if (
     String(payload.organization ?? '') !== config.organization ||
     String(payload.iss ?? '') !== config.deploymentId ||
     String(payload.deployment_id ?? '') !== config.deploymentId ||
-    !audiences.includes(audience) ||
+    !audiences.includes('web-api') ||
     !Number.isSafeInteger(expiresAt) ||
     expiresAt <= Math.floor(Date.now() / 1000)
   ) {
-    throw new Error(`${audience} 凭证与当前部署或机构不一致`)
-  }
-  if (deviceId && String(payload.device_id ?? '') !== deviceId) {
-    throw new Error('IM 凭证设备与当前窗口不一致')
+    throw new Error('web-api 凭证与当前部署或机构不一致')
   }
 
   return expiresAt
+}
+
+function assertImChallengeJwt(
+  token: string,
+  config: TenantBrandConfig,
+  userId: string,
+  deviceId: string,
+  clientId: string
+): Omit<ImChallengeCredential, 'token'> {
+  const payload = decodeJwtPayload(token)
+  const audiences = jwtAudiences(payload.aud)
+  const expiresAt = payload.exp
+  const notBefore = payload.nbf
+  const credentialSessionId =
+    typeof payload.session_id === 'string' ? payload.session_id.trim() : ''
+  const tokenUserId = typeof payload.user_id === 'string' ? payload.user_id.trim() : ''
+  const clientFamily =
+    typeof payload.client_family === 'string' ? payload.client_family.trim() : ''
+  const os = typeof payload.os === 'string' ? payload.os.trim() : ''
+  const now = Math.floor(Date.now() / 1000)
+  if (
+    payload.iss !== config.deploymentId ||
+    payload.deployment_id !== config.deploymentId ||
+    String(payload.organization ?? '') !== config.organization ||
+    !audiences.includes('im') ||
+    userId.trim() === '' ||
+    tokenUserId === '' ||
+    tokenUserId !== userId ||
+    payload.device_id !== deviceId ||
+    payload.client_id !== clientId ||
+    clientFamily !== 'web' ||
+    os === '' ||
+    typeof notBefore !== 'number' ||
+    !Number.isSafeInteger(notBefore) ||
+    notBefore <= 0 ||
+    notBefore > now + 30 ||
+    typeof expiresAt !== 'number' ||
+    !Number.isSafeInteger(expiresAt) ||
+    expiresAt <= now ||
+    expiresAt <= notBefore ||
+    credentialSessionId === ''
+  ) {
+    throw new Error('IM 凭证与当前部署、机构、设备或连接 challenge 不一致')
+  }
+
+  return {
+    expireAt: expiresAt,
+    deviceId,
+    clientId,
+    credentialSessionId
+  }
 }
 
 function assertResourceUrl(value: string, base?: string) {
@@ -218,18 +284,15 @@ export function getWebDeviceId() {
 }
 
 function normalizeWindowSession(session: WebImSession): WebImSession {
-  const deviceId = getWebDeviceId()
-  if (session.imToken?.deviceId === deviceId) {
-    return session
-  }
-
   return {
-    ...session,
-    imToken: {
-      token: '',
-      expireAt: 0,
-      deviceId
-    }
+    accessToken: String(session.accessToken ?? ''),
+    refreshToken: String(session.refreshToken ?? ''),
+    expiresIn: Number(session.expiresIn ?? 0),
+    organization: String(session.organization ?? ''),
+    deploymentId: String(session.deploymentId ?? ''),
+    apiServerUrl: String(session.apiServerUrl ?? ''),
+    imServerUrl: String(session.imServerUrl ?? ''),
+    user: session.user
   }
 }
 
@@ -250,7 +313,9 @@ export function mapWebImUser(payload: WebImUserPayload): WebImUser {
     account: String(payload.account ?? ''),
     nickname: String(payload.nickname ?? payload.account ?? '未命名用户'),
     signature: String(payload.signature ?? ''),
-    avatarUrl: String(payload.avatar ?? ''),
+    avatarFileId: String(payload.avatar_file_id ?? ''),
+    avatarUrl: String(payload.avatar_url ?? ''),
+    avatarExpiresAt: Number(payload.avatar_expires_at ?? 0),
     mobile: String(payload.mobile ?? ''),
     imShortNo: String(payload.im_short_no ?? ''),
     gender: Number(payload.gender ?? 0),
@@ -272,7 +337,9 @@ export function mapContact(payload: WebImUserPayload): Contact {
     account: user.account,
     name: user.nickname,
     avatar: firstText(user.nickname || user.account),
+    avatarFileId: user.avatarFileId,
     avatarUrl: user.avatarUrl,
+    avatarExpiresAt: user.avatarExpiresAt,
     title: user.signature || user.account || user.imShortNo || 'IM 用户',
     status: user.statusText,
     online: false,
@@ -322,11 +389,7 @@ export async function loginWebIm(
 
   const accessToken = String(data.token.access_token ?? '')
   if (!accessToken) throw new Error('登录响应缺少 access token')
-  assertJwtContext(accessToken, config, 'web-api')
-  const imToken = mapImToken(data.im_token)
-  if (imToken.token) {
-    imToken.expireAt = assertJwtContext(imToken.token, config, 'im', getWebDeviceId())
-  }
+  assertWebApiJwtContext(accessToken, config)
 
   return normalizeWindowSession({
     accessToken,
@@ -336,25 +399,30 @@ export async function loginWebIm(
     deploymentId: config.deploymentId,
     apiServerUrl: config.serverInfo.apiServerUrl,
     imServerUrl: config.serverInfo.imServerUrl,
-    imToken,
     user: mapWebImUser(data.user)
   })
 }
 
-export async function refreshImToken(
+export async function issueImChallengeToken(
   config: TenantBrandConfig,
-  session: WebImSession
-): Promise<ImTokenInfo> {
-  const data = await requestWebApi<ImTokenPayload>(config, '/saimulti/web/im/imToken', {
+  session: WebImSession,
+  clientId: string
+): Promise<ImChallengeCredential> {
+  const challengeClientId = clientId.trim()
+  if (!challengeClientId) throw new Error('IM client_id challenge 无效')
+  const deviceId = getWebDeviceId()
+  const data = await requestWebApi<ImTokenResponse>(config, '/saimulti/web/im/imToken', {
     method: 'POST',
     token: session.accessToken,
-    body: { device_id: getWebDeviceId() }
+    body: { device_id: deviceId, client_id: challengeClientId }
   })
 
-  const token = mapImToken(data)
-  if (!token.token) throw new Error('IM 凭证响应无效')
-  token.expireAt = assertJwtContext(token.token, config, 'im', getWebDeviceId())
-  return token
+  const token = String(data.token ?? '')
+  if (!token) throw new Error('IM 凭证响应无效')
+  return {
+    token,
+    ...assertImChallengeJwt(token, config, session.user.userId, deviceId, challengeClientId)
+  }
 }
 
 export async function fetchCurrentWebUser(
@@ -371,12 +439,12 @@ export async function fetchCurrentWebUser(
 export async function updateWebAvatar(
   config: TenantBrandConfig,
   session: WebImSession,
-  avatar: string
+  avatarFileId: string
 ): Promise<WebImUser> {
   const data = await requestWebApi<WebImUserPayload>(config, '/saimulti/web/im/updateAvatar', {
     method: 'POST',
     token: session.accessToken,
-    body: { avatar }
+    body: { avatar_file_id: avatarFileId }
   })
 
   return mapWebImUser(data)
@@ -505,7 +573,9 @@ export function mapConversation(payload: ConversationPayload): ImConversation {
     conversationSortId: Number(payload.conversation_sort_id ?? 0),
     conversationType: type,
     title,
-    avatar: type === 'group' ? String(payload.avatar ?? '') : String(payload.avatar || firstText(title)),
+    avatar: String(payload.avatar_url || firstText(title)),
+    avatarFileId: String(payload.avatar_file_id ?? ''),
+    avatarExpiresAt: Number(payload.avatar_expires_at ?? 0),
     description: type === 'group' ? String(payload.description ?? '') : '',
     avatarMembers: Array.isArray(payload.avatar_members)
       ? payload.avatar_members.map(mapAvatarMember)
@@ -534,7 +604,7 @@ function mapAvatarMember(payload: WebImUserPayload): AvatarMember {
     userId: String(payload.user_id ?? ''),
     nickname: String(payload.nickname ?? payload.account ?? ''),
     account: String(payload.account ?? ''),
-    avatarUrl: String(payload.avatar ?? '')
+    avatarUrl: String(payload.avatar_url ?? '')
   }
 }
 
@@ -562,6 +632,8 @@ export function createVirtualConversation(contact: Contact): ImConversation {
     conversationType: 'single',
     title: contact.name,
     avatar: contact.avatarUrl || contact.avatar,
+    avatarFileId: contact.avatarFileId,
+    avatarExpiresAt: contact.avatarExpiresAt,
     description: '',
     avatarMembers: [],
     peerUserId: contact.userId,
@@ -571,7 +643,9 @@ export function createVirtualConversation(contact: Contact): ImConversation {
       account: contact.account,
       nickname: contact.name,
       signature: contact.signature,
+      avatarFileId: contact.avatarFileId,
       avatarUrl: contact.avatarUrl,
+      avatarExpiresAt: contact.avatarExpiresAt,
       mobile: contact.mobile,
       imShortNo: contact.imShortNo,
       gender: 0,
@@ -757,7 +831,13 @@ export async function updateConversationSetting(
 export async function updateGroupProfile(
   config: TenantBrandConfig,
   session: WebImSession,
-  payload: { conversationId: string; title?: string; avatar?: string; description?: string; notifyAll?: boolean }
+  payload: {
+    conversationId: string
+    title?: string
+    avatarFileId?: string
+    description?: string
+    notifyAll?: boolean
+  }
 ): Promise<{ conversation: ImConversation; noticeMessage: ImPacketMessage | null }> {
   const data = await requestWebApi<UpdateGroupProfilePayload>(config, '/saimulti/web/im/updateGroupProfile', {
     method: 'POST',
@@ -765,7 +845,7 @@ export async function updateGroupProfile(
     body: {
       conversation_id: payload.conversationId,
       title: payload.title,
-      avatar: payload.avatar,
+      avatar_file_id: payload.avatarFileId,
       description: payload.description,
       notify_all: payload.notifyAll ?? false
     }
@@ -889,35 +969,11 @@ export async function uploadImAsset(
   })
   options.onProgress?.(8)
 
-  if (prepared.mode === 'direct') {
-    if (!prepared.upload_url || !prepared.object_key) {
-      throw new Error('直传配置不完整')
-    }
-    await uploadFileByXhr(prepared.upload_url, file, {
-      method: prepared.method ?? 'PUT',
-      headers: prepared.headers ?? {},
-      onProgress: (progress) => options.onProgress?.(8 + Math.round(progress * 0.84))
-    })
-    options.onProgress?.(94)
-
-    const confirmed = await requestWebApi<UploadedAssetPayload>(config, '/saimulti/web/im/confirmUpload', {
-      method: 'POST',
-      token: session.accessToken,
-      body: {
-        kind,
-        filename: file.name,
-        object_key: prepared.object_key,
-        size: file.size,
-        mime_type: file.type,
-        extension: prepared.extension
-      }
-    })
-
-    options.onProgress?.(100)
-    return mapUploadedAsset(config, confirmed, file)
-  }
-
-  if (prepared.mode === 'proxy') {
+  if (
+    prepared.mode === 'proxy' &&
+    prepared.method === 'POST' &&
+    prepared.upload_path === '/saimulti/web/im/upload'
+  ) {
     return uploadImAssetByProxy(config, session, file, kind, options.onProgress)
   }
 
@@ -941,45 +997,101 @@ async function uploadImAssetByProxy(
   })
 
   onProgress?.(100)
-  return mapUploadedAsset(config, data, file)
+  const asset = mapUploadedAsset(data, file)
+  return {
+    ...asset,
+    url: await resolveImAssetUrl(config, session, { fileId: asset.fileId })
+  }
 }
 
-function uploadFileByXhr(
-  url: string,
-  file: File,
-  options: { method: string; headers: Record<string, string>; onProgress?: UploadProgressHandler }
-): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const uploadUrl = assertResourceUrl(url)
-    const xhr = new XMLHttpRequest()
-    xhr.open(options.method, uploadUrl, true)
-    Object.entries(options.headers).forEach(([key, value]) => {
-      xhr.setRequestHeader(key, value)
-    })
-    xhr.upload.onprogress = (event) => {
-      if (!event.lengthComputable || !options.onProgress) return
-      options.onProgress(Math.round((event.loaded / event.total) * 100))
+export async function deriveForwardAsset(
+  config: TenantBrandConfig,
+  session: WebImSession,
+  source: {
+    conversationId: string
+    messageId: string
+    fileId: string
+    kind: UploadedAsset['kind']
+  }
+): Promise<UploadedAsset> {
+  const data = await requestWebApi<UploadedAssetPayload>(config, '/saimulti/web/im/deriveForwardAsset', {
+    method: 'POST',
+    token: session.accessToken,
+    body: {
+      conversation_id: source.conversationId,
+      message_id: source.messageId,
+      file_id: source.fileId,
+      kind: source.kind
     }
-    xhr.onerror = () => reject(new Error('直传失败，请检查网络后重试'))
-    xhr.onload = () => {
-      if (xhr.status < 200 || xhr.status >= 300) {
-        reject(new Error(`直传失败：${xhr.status}`))
-        return
-      }
-      resolve()
-    }
-    xhr.send(file)
   })
-}
-
-function mapUploadedAsset(config: TenantBrandConfig, data: UploadedAssetPayload, file: File): UploadedAsset {
-  const base = config.serverInfo.uploadServerUrl || config.serverInfo.apiServerUrl
-  const url = String(data.url ?? '')
+  const asset = mapUploadedAsset(data, {
+    name: '',
+    size: 0,
+    type: ''
+  })
+  if (asset.kind !== source.kind) throw new Error('派生附件类型与原消息不一致')
 
   return {
+    ...asset,
+    url: await resolveImAssetUrl(config, session, { fileId: asset.fileId })
+  }
+}
+
+export async function resolveImAssetUrl(
+  config: TenantBrandConfig,
+  session: WebImSession,
+  source: {
+    fileId: string
+    conversationId?: string
+    messageId?: string
+  },
+  force = false
+): Promise<string> {
+  if (!/^[a-f0-9]{40}$/.test(source.fileId)) throw new Error('附件缺少可信 file_id')
+  const conversationId = String(source.conversationId ?? '')
+  const messageId = String(source.messageId ?? '')
+  if (Boolean(conversationId) !== Boolean(messageId)) throw new Error('附件消息上下文不完整')
+  const cacheKey = `${session.organization}:${session.user.userId}:${source.fileId}`
+  const cached = privateAssetUrlCache.get(cacheKey)
+  const now = Math.floor(Date.now() / 1000)
+  if (!force && cached && cached.expiresAt > now + PRIVATE_ASSET_CACHE_SKEW_SECONDS) {
+    return cached.url
+  }
+
+  const data = await requestWebApi<AssetUrlPayload>(config, '/saimulti/web/im/resolveAssetUrl', {
+    method: 'POST',
+    token: session.accessToken,
+    body: {
+      file_id: source.fileId,
+      ...(conversationId ? { conversation_id: conversationId, message_id: messageId } : {})
+    }
+  })
+  const expiresAt = Number(data.expires_at ?? 0)
+  if (
+    data.file_id !== source.fileId ||
+    !Number.isSafeInteger(expiresAt) ||
+    expiresAt <= now + PRIVATE_ASSET_CACHE_SKEW_SECONDS
+  ) {
+    throw new Error('附件临时访问凭证无效')
+  }
+  const url = assertResourceUrl(String(data.url ?? ''))
+  privateAssetUrlCache.set(cacheKey, { url, expiresAt })
+
+  return url
+}
+
+function mapUploadedAsset(
+  data: UploadedAssetPayload,
+  file: Pick<File, 'name' | 'size' | 'type'>
+): UploadedAsset {
+  const fileId = String(data.file_id ?? '')
+  if (!/^[a-f0-9]{40}$/.test(fileId)) throw new Error('上传响应缺少可信 file_id')
+
+  return {
+    fileId,
     kind: data.kind,
     name: String(data.name ?? file.name),
-    url: assertResourceUrl(url, base),
+    url: '',
     size: Number(data.size ?? file.size),
     mimeType: String(data.mime_type ?? file.type),
     extension: String(data.extension ?? '')
@@ -1011,5 +1123,11 @@ export function loadWebSession(config: TenantBrandConfig): WebImSession | null {
 }
 
 export function clearWebSession(_session?: WebImSession | null) {
+  if (_session) {
+    const prefix = `${_session.organization}:${_session.user.userId}:`
+    for (const key of privateAssetUrlCache.keys()) {
+      if (key.startsWith(prefix)) privateAssetUrlCache.delete(key)
+    }
+  }
   window.sessionStorage.removeItem(WINDOW_STORAGE_KEY)
 }
