@@ -9,7 +9,6 @@
     "typecheck": "vue-tsc --noEmit",
     "test:realtime-dedup": "node --experimental-strip-types --test tests/realtimeEventDedup.test.ts",
     "test:routing": "node --experimental-strip-types --test tests/routing.test.ts",
-    "test:routing-live": "node --experimental-strip-types scripts/local-routing-failover.mjs",
     "build": "vue-tsc --noEmit && vite build",
     "preview": "vite preview --host 127.0.0.1"
   },
