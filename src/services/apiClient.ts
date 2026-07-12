@@ -1,4 +1,5 @@
 import type { TenantBrandConfig } from './tenantConfig'
+import { activeServiceCandidate, promoteServiceCandidate } from './routing'
 
 interface ApiResponse<T> {
   code?: number
@@ -42,14 +43,15 @@ function assertApiContext(config: TenantBrandConfig) {
 export function createWebApiUrl(
   config: TenantBrandConfig,
   path: string,
-  query?: WebApiOptions['query']
+  query?: WebApiOptions['query'],
+  baseUrl = activeServiceCandidate(config, 'api').url
 ) {
   assertApiContext(config)
   if (!path.startsWith('/') || path.startsWith('//')) {
     throw new Error('API 路径必须是站内绝对路径')
   }
 
-  const url = new URL(`${config.serverInfo.apiServerUrl}${path}`)
+  const url = new URL(`${baseUrl}${path}`)
   if (query) {
     Object.entries(query).forEach(([key, value]) => {
       if (value !== undefined && String(value).trim() !== '') {
@@ -90,27 +92,52 @@ export async function requestWebApi<T>(
     init.body = JSON.stringify(options.body)
   }
 
-  const controller = new AbortController()
-  const timeout = window.setTimeout(() => controller.abort(), API_TIMEOUT_MS)
-  init.signal = controller.signal
-  let response: Response
-  try {
-    response = await fetch(createWebApiUrl(config, path, options.query), init)
-  } catch (error) {
-    if (controller.signal.aborted) throw new WebApiError('请求超时，请检查目标服务', 0)
-    throw error
-  } finally {
-    window.clearTimeout(timeout)
+  const safeToRetry = (options.method ?? 'GET') === 'GET'
+  const attempts = safeToRetry ? config.serverInfo.routes.length : 1
+  let lastNetworkError: unknown
+  for (let attempt = 0; attempt < Math.max(1, attempts); attempt += 1) {
+    const candidate = activeServiceCandidate(config, 'api')
+    const controller = new AbortController()
+    const timeout = window.setTimeout(() => controller.abort(), API_TIMEOUT_MS)
+    init.signal = controller.signal
+    let response: Response
+    try {
+      response = await fetch(createWebApiUrl(config, path, options.query, candidate.url), init)
+    } catch (error) {
+      lastNetworkError = error
+      if (!safeToRetry || attempt + 1 >= attempts) {
+        if (controller.signal.aborted) throw new WebApiError('请求超时，请检查目标服务', 0)
+        throw error
+      }
+      const next = promoteServiceCandidate(config, 'api', candidate.routeId)
+      console.warn('[b8im:routing] API 线路网络失败，切换备用线路', {
+        failedRouteId: candidate.routeId,
+        nextRouteId: next.routeId
+      })
+      continue
+    } finally {
+      window.clearTimeout(timeout)
+    }
+    if (safeToRetry && [502, 503, 504].includes(response.status) && attempt + 1 < attempts) {
+      const next = promoteServiceCandidate(config, 'api', candidate.routeId)
+      console.warn('[b8im:routing] API 线路暂不可用，切换备用线路', {
+        failedRouteId: candidate.routeId,
+        nextRouteId: next.routeId,
+        status: response.status
+      })
+      continue
+    }
+    const payload = await readPayload<T>(response)
+    if (!response.ok || payload.code !== 200) {
+      throw new WebApiError(
+        payload.message || `请求失败：${response.status}`,
+        response.status,
+        payload.code
+      )
+    }
+    return payload.data as T
   }
-  const payload = await readPayload<T>(response)
-  if (!response.ok || payload.code !== 200) {
-    throw new WebApiError(
-      payload.message || `请求失败：${response.status}`,
-      response.status,
-      payload.code
-    )
-  }
-  return payload.data as T
+  throw lastNetworkError ?? new WebApiError('没有可用的 API 线路', 0)
 }
 
 export function requestWebApiWithUpload<T>(

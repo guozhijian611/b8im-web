@@ -8,6 +8,7 @@ import {
   RealtimeEventDedupWindow
 } from '../services/realtimeEventDedup'
 import type { TenantBrandConfig } from '../services/tenantConfig'
+import { activeServiceCandidate, promoteServiceCandidate } from '../services/routing'
 import { notifyTitleIncomingMessage } from '../services/titleNotifier'
 import { formatImMessageTime, formatImTime, parseImTimestamp } from '../services/time'
 import {
@@ -376,6 +377,7 @@ export function useImRuntime(
   })
 
   let socket: WebSocket | null = null
+  const socketRouteIds = new WeakMap<WebSocket, string>()
   let authChallengeSequence = 0
   let pendingAuthChallenge: AuthChallengeState | null = null
   let authenticatedConnection: AuthenticatedConnectionState | null = null
@@ -616,7 +618,8 @@ export function useImRuntime(
   function connect() {
     clearReconnect()
     closeSocket()
-    const wsUrl = config().serverInfo.imServerUrl
+    const routeCandidate = activeServiceCandidate(config(), 'im')
+    const wsUrl = routeCandidate.url
     if (!wsUrl) {
       connectionState.value = 'offline'
       logWsStatus('offline:no-im-server-url')
@@ -626,6 +629,7 @@ export function useImRuntime(
     connectionState.value = 'connecting'
     logWsStatus('connecting', { url: wsUrl })
     const current = new WebSocket(wsUrl)
+    socketRouteIds.set(current, routeCandidate.routeId)
     socket = current
     current.addEventListener('open', () => {
       if (socket !== current) return
@@ -647,6 +651,17 @@ export function useImRuntime(
         reason: event.reason,
         wasClean: event.wasClean
       })
+      if ([1006, 1011, 1012, 1013].includes(event.code)) {
+        const failedRouteId = socketRouteIds.get(current) ?? routeCandidate.routeId
+        const next = promoteServiceCandidate(config(), 'im', failedRouteId)
+        if (next.routeId !== failedRouteId) {
+          logWsStatus('routing:failover', {
+            failedRouteId,
+            nextRouteId: next.routeId,
+            closeCode: event.code
+          })
+        }
+      }
       scheduleReconnect()
     })
     current.addEventListener('error', () => {

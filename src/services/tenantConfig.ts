@@ -1,4 +1,11 @@
 import { API_PATHS } from '../config/apiPaths'
+import {
+  parseRoutingPublicKeys,
+  parseRoutingServerInfo,
+  verifyRoutingSignature,
+  type RoutingServerInfo,
+  type RoutingSignature
+} from './routing'
 
 export interface AppDownloadLink {
   label: string
@@ -6,12 +13,7 @@ export interface AppDownloadLink {
   platform: 'ios' | 'android'
 }
 
-export interface TenantServerInfo {
-  webServerUrl: string
-  apiServerUrl: string
-  imServerUrl: string
-  uploadServerUrl: string
-}
+export type TenantServerInfo = RoutingServerInfo
 
 export interface LegalAgreement {
   title: string
@@ -24,6 +26,7 @@ export interface TenantBrandConfig {
   organization: string
   deploymentId: string
   enterpriseCode: string
+  clientFamily: 'web'
   configVersion: number
   updatedAt: string
   mode: TenantDiscoveryMode
@@ -37,6 +40,7 @@ export interface TenantBrandConfig {
   publicSecurityRecordUrl: string
   copyright: string
   serverInfo: TenantServerInfo
+  routingSignature: RoutingSignature | null
   agreements: {
     userAgreement: LegalAgreement
     privacyPolicy: LegalAgreement
@@ -117,6 +121,24 @@ function assertOrganization(value: string) {
     throw new Error('企业信息 organization 格式无效')
   }
   return value
+}
+
+function assertHighestRoutingVersion(deploymentId: string, organization: number, routingVersion: number) {
+  const key = `b8im:routing-version:${deploymentId}:${organization}:web`
+  let previous = 0
+  try {
+    previous = Number(window.localStorage.getItem(key) || 0)
+  } catch {
+    previous = 0
+  }
+  if (Number.isSafeInteger(previous) && previous > routingVersion) {
+    throw new Error('检测到旧线路配置回放，已拒绝加载')
+  }
+  try {
+    window.localStorage.setItem(key, String(Math.max(previous, routingVersion)))
+  } catch {
+    // 浏览器禁用 localStorage 时，本次签名和有效期校验仍然成立。
+  }
 }
 
 function assertServerUrl(
@@ -204,6 +226,7 @@ export function createUndiscoveredTenantConfig(): TenantBrandConfig {
     organization: '',
     deploymentId: '',
     enterpriseCode: mode === 'enterprise_code' ? queryEnterpriseCode() : '',
+    clientFamily: 'web',
     configVersion: 0,
     updatedAt: '',
     mode,
@@ -217,11 +240,27 @@ export function createUndiscoveredTenantConfig(): TenantBrandConfig {
     publicSecurityRecordUrl: '',
     copyright: envValue('VITE_WEB_DEFAULT_COPYRIGHT') || 'Copyright © 2026 b8im',
     serverInfo: {
+      schemaVersion: 2,
+      routePoolId: '',
+      routePoolVersion: 0,
+      routingVersion: 0,
+      issuedAt: '',
+      expiresAt: '',
+      staleIfErrorUntil: '',
+      policy: {
+        mode: 'single',
+        primaryRouteId: '',
+        backupRouteIds: [],
+        switchCooldownSeconds: 0,
+        connectTimeoutMs: 5000
+      },
+      routes: [],
       webServerUrl: '',
       apiServerUrl: '',
       imServerUrl: '',
       uploadServerUrl: ''
     },
+    routingSignature: null,
     agreements: {
       userAgreement: { title: '用户协议', content: '' },
       privacyPolicy: { title: '隐私政策', content: '' }
@@ -231,7 +270,7 @@ export function createUndiscoveredTenantConfig(): TenantBrandConfig {
   }
 }
 
-function mapAppInfo(data: Record<string, unknown>, mode: TenantDiscoveryMode): TenantBrandConfig {
+async function mapAppInfo(data: Record<string, unknown>, mode: TenantDiscoveryMode): Promise<TenantBrandConfig> {
   const serverInfo = readObject(data, 'server_info')
   const agreements = readObject(data, 'agreements')
   const download = readObject(data, 'download')
@@ -243,11 +282,33 @@ function mapAppInfo(data: Record<string, unknown>, mode: TenantDiscoveryMode): T
   const publicSecurityRecordNo = readOptionalString(data, 'public_security_record_no')
   const iosDownload = normalizeDownloadUrl(readOptionalString(download, 'ios'), 'ios')
   const androidDownload = normalizeDownloadUrl(readOptionalString(download, 'android'), 'android')
+  const organizationValue = data.organization
+  if (typeof organizationValue !== 'number' || !Number.isSafeInteger(organizationValue) || organizationValue <= 0) {
+    throw new Error('企业信息 organization 格式无效')
+  }
+  const deploymentId = assertDeploymentId(readRequiredString(data, 'deployment_id'))
+  const enterpriseCode = normalizeEnterpriseCode(readRequiredString(data, 'enterprise_code'))
+  if (data.client_family !== 'web') throw new Error('企业信息 client_family 与 Web 请求不一致')
+  const trustedKeys = parseRoutingPublicKeys(envValue('VITE_ROUTING_PUBLIC_KEYS'))
+  const routingSignature = await verifyRoutingSignature(
+    {
+      organization: organizationValue,
+      deployment_id: deploymentId,
+      enterprise_code: enterpriseCode,
+      client_family: 'web',
+      server_info: serverInfo
+    },
+    data.routing_signature,
+    trustedKeys
+  )
+  const routingServerInfo = parseRoutingServerInfo(serverInfo, deploymentId, assertServerUrl)
+  assertHighestRoutingVersion(deploymentId, organizationValue, routingServerInfo.routingVersion)
 
   return {
-    organization: assertOrganization(readRequiredString(data, 'organization')),
-    deploymentId: assertDeploymentId(readRequiredString(data, 'deployment_id')),
-    enterpriseCode: normalizeEnterpriseCode(readRequiredString(data, 'enterprise_code')),
+    organization: assertOrganization(String(organizationValue)),
+    deploymentId,
+    enterpriseCode,
+    clientFamily: 'web',
     configVersion,
     updatedAt: (() => {
       const value = readRequiredString(data, 'updated_at')
@@ -268,32 +329,8 @@ function mapAppInfo(data: Record<string, unknown>, mode: TenantDiscoveryMode): T
       'public_security_record_url'
     ),
     copyright: readOptionalString(data, 'copyright') || `Copyright © ${new Date().getFullYear()} ${siteName}`,
-    serverInfo: {
-      apiServerUrl: assertServerUrl(
-        readOptionalString(serverInfo, 'api_server_url'),
-        'api_server_url',
-        'http',
-        true
-      ),
-      imServerUrl: assertServerUrl(
-        readOptionalString(serverInfo, 'im_server_url'),
-        'im_server_url',
-        'websocket',
-        true
-      ),
-      uploadServerUrl: assertServerUrl(
-        readOptionalString(serverInfo, 'upload_server_url'),
-        'upload_server_url',
-        'http',
-        true
-      ),
-      webServerUrl: assertServerUrl(
-        readOptionalString(serverInfo, 'web_server_url'),
-        'web_server_url',
-        'http',
-        true
-      )
-    },
+    serverInfo: routingServerInfo,
+    routingSignature,
     agreements: {
       userAgreement: readAgreement(agreements, 'user_agreement', '用户协议'),
       privacyPolicy: readAgreement(agreements, 'privacy_policy', '隐私政策')
@@ -307,6 +344,7 @@ function mapAppInfo(data: Record<string, unknown>, mode: TenantDiscoveryMode): T
 
 function discoveryUrl(mode: TenantDiscoveryMode, enterpriseCode = '') {
   const url = new URL(discoveryPath(), discoveryBaseUrl())
+  url.searchParams.set('client_family', 'web')
   if (mode === 'domain') {
     url.searchParams.set('mode', 'domain')
     url.searchParams.set('domain', normalizeHost(window.location.hostname))
@@ -357,7 +395,7 @@ export async function resolveTenantConfig(
     throw new Error('企业信息响应格式无效')
   }
 
-  const config = mapAppInfo(payload.data as Record<string, unknown>, mode)
+  const config = await mapAppInfo(payload.data as Record<string, unknown>, mode)
   if (
     mode === 'enterprise_code' &&
     config.enterpriseCode !== normalizeEnterpriseCode(enterpriseCode || queryEnterpriseCode())
