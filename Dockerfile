@@ -2,8 +2,13 @@
 
 FROM node:24-alpine AS build
 
+ARG VITE_ROUTING_PUBLIC_KEYS="{}"
+ARG VITE_PLATFORM_DEFAULT_HOSTS=""
+
 ENV PNPM_HOME=/pnpm \
-    PATH=/pnpm:$PATH
+    PATH=/pnpm:$PATH \
+    VITE_ROUTING_PUBLIC_KEYS=$VITE_ROUTING_PUBLIC_KEYS \
+    VITE_PLATFORM_DEFAULT_HOSTS=$VITE_PLATFORM_DEFAULT_HOSTS
 
 RUN corepack enable && corepack prepare pnpm@11.5.1 --activate
 

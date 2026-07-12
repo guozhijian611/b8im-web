@@ -59,6 +59,7 @@ const env = import.meta.env
 const PUBLIC_SECURITY_RECORD_SEARCH_URL = 'https://beian.mps.gov.cn/#/query/webSearch'
 const LOCAL_HOSTS = new Set(['127.0.0.1', 'localhost', '::1', '[::1]'])
 const DISCOVERY_TIMEOUT_MS = 8000
+const ENTERPRISE_CODE_STORAGE_PREFIX = 'b8im:enterprise-code:'
 
 function envValue(key: keyof ImportMetaEnv) {
   return String(env[key] ?? '').trim()
@@ -193,7 +194,19 @@ function normalizeOptionalResourceUrl(value: string, field: string) {
   return value ? assertServerUrl(value, field, 'http', false, true) : ''
 }
 
+function platformDefaultHosts() {
+  return new Set(
+    envValue('VITE_PLATFORM_DEFAULT_HOSTS')
+      .split(',')
+      .map(normalizeHost)
+      .filter(Boolean)
+  )
+}
+
 function defaultMode(): TenantDiscoveryMode {
+  if (platformDefaultHosts().has(normalizeHost(window.location.hostname))) {
+    return 'enterprise_code'
+  }
   const value = envValue('VITE_APP_MODE') || 'domain'
   if (value !== 'domain' && value !== 'enterprise_code') {
     throw new Error('VITE_APP_MODE 只能是 domain 或 enterprise_code')
@@ -220,12 +233,43 @@ function queryEnterpriseCode() {
   return (searchParams.get('enterprise_code') || '').trim()
 }
 
+function enterpriseCodeStorageKey() {
+  return `${ENTERPRISE_CODE_STORAGE_PREFIX}${normalizeHost(window.location.hostname)}`
+}
+
+function cachedEnterpriseCode() {
+  try {
+    const value = window.localStorage.getItem(enterpriseCodeStorageKey()) || ''
+    return value ? normalizeEnterpriseCode(value) : ''
+  } catch {
+    try {
+      window.localStorage.removeItem(enterpriseCodeStorageKey())
+    } catch {
+      // localStorage 不可用时保持无缓存启动。
+    }
+    return ''
+  }
+}
+
+function initialEnterpriseCode(mode: TenantDiscoveryMode) {
+  if (mode !== 'enterprise_code') return ''
+  return queryEnterpriseCode() || cachedEnterpriseCode()
+}
+
+function cacheEnterpriseCode(enterpriseCode: string) {
+  try {
+    window.localStorage.setItem(enterpriseCodeStorageKey(), normalizeEnterpriseCode(enterpriseCode))
+  } catch {
+    // 浏览器禁用 localStorage 时不影响本次已验签的发现结果。
+  }
+}
+
 export function createUndiscoveredTenantConfig(): TenantBrandConfig {
   const mode = defaultMode()
   return {
     organization: '',
     deploymentId: '',
-    enterpriseCode: mode === 'enterprise_code' ? queryEnterpriseCode() : '',
+    enterpriseCode: initialEnterpriseCode(mode),
     clientFamily: 'web',
     configVersion: 0,
     updatedAt: '',
@@ -402,6 +446,7 @@ export async function resolveTenantConfig(
   ) {
     throw new Error('企业信息 enterprise_code 与发现请求不一致')
   }
+  if (mode === 'enterprise_code') cacheEnterpriseCode(config.enterpriseCode)
   console.info('[b8im] tenant discovered', {
     organization: config.organization,
     deploymentId: config.deploymentId,

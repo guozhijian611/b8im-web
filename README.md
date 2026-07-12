@@ -28,6 +28,8 @@ pnpm preview
 - 域名模式：`?mode=domain&domain=<当前 hostname>`
 - 企业码模式：`?enterprise_code=<企业码>`
 
+`VITE_PLATFORM_DEFAULT_HOSTS` 配置平台默认入口域名（逗号分隔）。命中的 host 不执行域名租户发现，而是展示企业码输入入口；URL 中的 `enterprise_code` 优先于本地缓存。客户端只在 `appInfo` 响应完成结构、线路版本和 Ed25519 签名校验后缓存企业码，后续再次访问同一平台 host 时自动加载；明确失败、非法或未验签的响应不会写入缓存。
+
 发现请求不发送 cookie、token 或 `App-Id`。响应必须是 `{code: 200, data: appInfo}`，其中 `appInfo` 至少包含：
 
 ```json
