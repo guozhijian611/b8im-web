@@ -13,6 +13,7 @@ import type {
 import { requestWebApi, requestWebApiWithUpload } from './apiClient'
 import type { TenantBrandConfig } from './tenantConfig'
 import { formatImTime } from './time'
+import type { TraceContext } from './telemetry'
 
 interface WebImUserPayload {
   id?: string | number
@@ -406,7 +407,8 @@ export async function loginWebIm(
 export async function issueImChallengeToken(
   config: TenantBrandConfig,
   session: WebImSession,
-  clientId: string
+  clientId: string,
+  traceContext?: TraceContext
 ): Promise<ImChallengeCredential> {
   const challengeClientId = clientId.trim()
   if (!challengeClientId) throw new Error('IM client_id challenge 无效')
@@ -414,7 +416,8 @@ export async function issueImChallengeToken(
   const data = await requestWebApi<ImTokenResponse>(config, '/saimulti/web/im/imToken', {
     method: 'POST',
     token: session.accessToken,
-    body: { device_id: deviceId, client_id: challengeClientId }
+    body: { device_id: deviceId, client_id: challengeClientId },
+    traceContext
   })
 
   const token = String(data.token ?? '')

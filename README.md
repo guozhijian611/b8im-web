@@ -62,6 +62,16 @@ Authorization: Bearer <目标 API 签发的 access token>
 
 请求明确使用 `credentials: omit`，不会把发现服务的 cookie/token 转发到目标 API。IM 只连接 `server_info.im_server_url`，AUTH 使用目标 API 签发的短期 IM token。登录会话按当前浏览器窗口和 `organization` 隔离；登录后 UI 不能切换机构。
 
+## Trace 上下文传播
+
+`src/services/telemetry.ts` 是 Web 自有的 telemetry adapter。当前阶段只负责 W3C Trace Context 的安全生成、继续和生命周期收口，不直连 Jaeger/Collector，不对外上报 Span。在受鉴权的公网 ingest gateway 上线前，不得在 Web 构建中放置 OTLP Token 或开放匿名 OTLP 入口。
+
+- Trace ID/Span ID 只使用 `crypto.getRandomValues` 生成；安全随机源不可用时停止传播，不使用 `Math.random` 降级，也不影响业务请求。
+- `requestWebApi` 与 XHR 上传统一注入 `traceparent`/可选 `tracestate`；不采集 Authorization、Cookie、账号、密码、请求/响应 body 或查询值。
+- 浏览器 WebSocket 不依赖自定义握手 Header；`AUTH` 和业务命令在 envelope 顶层携带 `traceparent`/`tracestate`，不放入 `data`。
+- `SEND` 使用 `client_msg_id` 保持本次传播上下文，直到 `SEND_ACK`、错误帧、30 秒超时或连接关闭才收口；`trace_id` 不代替 `client_msg_id`/`message_id`。
+- 错误快照只允许稳定 `error.code`/`error.type`、命令、重试次数和必要关联 ID；消息正文、Token、附件地址、文件名和任意服务端错误原文不进入 telemetry 或 console。
+
 ## 客户端配置与固定模块
 
 登录后调用：
@@ -112,6 +122,7 @@ Authorization: Bearer <access token>
 
 ```bash
 pnpm typecheck
+pnpm test:telemetry
 pnpm build
 git diff --check
 ```

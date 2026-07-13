@@ -11,6 +11,13 @@ import type { TenantBrandConfig } from '../services/tenantConfig'
 import { activeServiceCandidate, promoteServiceCandidate } from '../services/routing'
 import { notifyTitleIncomingMessage } from '../services/titleNotifier'
 import { formatImMessageTime, formatImTime, parseImTimestamp } from '../services/time'
+import { attachTraceContext, PendingSendTraceRegistry } from '../services/imTelemetry'
+import {
+  parseTraceContext,
+  tryStartTelemetrySpan,
+  type TelemetrySpan,
+  type TraceContext
+} from '../services/telemetry'
 import {
   createMessageGroup as createMessageGroupApi,
   createGroupConversation,
@@ -55,6 +62,8 @@ type ImPacket = {
   organization?: number | string
   data?: Record<string, any>
   client_msg_id?: string
+  traceparent?: string
+  tracestate?: string
 }
 
 type AuthChallengeState = {
@@ -64,6 +73,7 @@ type AuthChallengeState = {
   deviceId: string
   credentialSessionId: string
   authSent: boolean
+  traceSpan: TelemetrySpan | null
 }
 
 type AuthenticatedConnectionState = {
@@ -97,6 +107,7 @@ const MESSAGE_TYPE_FILE = 3
 const MESSAGE_TYPE_VOICE = 4
 const MESSAGE_TYPE_SYSTEM = 5
 const MESSAGE_TYPE_VIDEO = 11
+const SEND_TRACE_TIMEOUT_MS = 30000
 
 function firstText(value: string) {
   return (value.trim().slice(0, 1) || '用').toUpperCase()
@@ -386,6 +397,10 @@ export function useImRuntime(
   let localMessageOrder = 0
   let localConversationSortOrder = 0
   let recentRealtimeEvents: RealtimeEventDedupWindow | null = null
+  const pendingSendTraces = new PendingSendTraceRegistry(
+    SEND_TRACE_TIMEOUT_MS,
+    (clientMsgId) => markLocalMessageFailed(clientMsgId)
+  )
 
   function realtimeEventWindow() {
     const organization = String(session().organization ?? '').trim()
@@ -424,6 +439,35 @@ export function useImRuntime(
       state: connectionState.value,
       ...detail
     })
+  }
+
+  function packetTraceContext(packet: ImPacket) {
+    return parseTraceContext(packet.traceparent, packet.tracestate)
+  }
+
+  function startWsSpan(command: string, parent?: TraceContext | null, clientMsgId?: string) {
+    return tryStartTelemetrySpan({
+      name: `web.websocket.${command}`,
+      kind: command === 'send' ? 'producer' : 'client',
+      parent,
+      fields: {
+        organization: session().organization,
+        command,
+        ...(clientMsgId ? { clientMsgId } : {})
+      }
+    })
+  }
+
+  function trackSendTrace(clientMsgId: string, span: TelemetrySpan) {
+    pendingSendTraces.track(clientMsgId, span)
+  }
+
+  function finishSendTrace(clientMsgId: string, errorCode = '') {
+    pendingSendTraces.finish(clientMsgId, errorCode)
+  }
+
+  function failPendingSendTraces(code: string, type: string) {
+    pendingSendTraces.failAll(code, type)
   }
 
   async function boot() {
@@ -643,6 +687,7 @@ export function useImRuntime(
       if (socket !== current) return
       window.clearInterval(pingTimer)
       pingTimer = 0
+      failPendingSendTraces('IM_WEBSOCKET_CLOSED', 'connection_closed')
       clearSocketAuthState(current)
       socket = null
       connectionState.value = 'offline'
@@ -690,11 +735,12 @@ export function useImRuntime(
       clientId,
       deviceId: getWebDeviceId(),
       credentialSessionId: '',
-      authSent: false
+      authSent: false,
+      traceSpan: startWsSpan('auth', packetTraceContext(packet))
     }
     pendingAuthChallenge = challenge
     logWsStatus('auth:challenge-received', {
-      clientId,
+      hasClientId: true,
       challengeSequence: challenge.sequence
     })
     void authenticateChallenge(challenge)
@@ -702,14 +748,20 @@ export function useImRuntime(
 
   async function authenticateChallenge(challenge: AuthChallengeState) {
     try {
-      const credential = await issueImChallengeToken(config(), session(), challenge.clientId)
+      const credential = await issueImChallengeToken(
+        config(),
+        session(),
+        challenge.clientId,
+        challenge.traceSpan?.context
+      )
       if (!isCurrentChallenge(challenge)) return
 
       pendingAuthChallenge = {
         ...challenge,
         deviceId: credential.deviceId,
         credentialSessionId: credential.credentialSessionId,
-        authSent: true
+        authSent: true,
+        traceSpan: challenge.traceSpan
       }
       if (
         !sendPacketToSocket(challenge.socket, {
@@ -719,17 +771,21 @@ export function useImRuntime(
             device_id: credential.deviceId,
             platform: 'web'
           }
-        })
+        }, challenge.traceSpan?.context)
       ) {
         throw new Error('IM 连接已关闭，无法发送鉴权凭证')
       }
       logWsStatus('auth:sent', {
-        clientId: challenge.clientId,
+        hasClientId: true,
         challengeSequence: challenge.sequence,
         expireAt: credential.expireAt
       })
     } catch (error) {
       if (!isCurrentChallenge(challenge)) return
+      challenge.traceSpan?.fail({
+        code: 'IM_AUTH_CREDENTIAL_ERROR',
+        type: 'credential_error'
+      })
       failSocketAuthentication(
         challenge.socket,
         'auth:credential-error',
@@ -898,7 +954,8 @@ export function useImRuntime(
       })
     }
     updateConversationPreview(conversation.id, preview)
-    sendPacket({
+    const sendTrace = startWsSpan('send', null, clientMsgId)
+    const sent = sendPacket({
       cmd: 'send',
       client_msg_id: clientMsgId,
       data: {
@@ -908,7 +965,17 @@ export function useImRuntime(
         message_type: messageType,
         content
       }
-    })
+    }, sendTrace)
+    if (!sent) {
+      sendTrace?.fail({
+        code: 'IM_SEND_SOCKET_UNAVAILABLE',
+        type: 'connection_unavailable',
+        clientMsgId
+      })
+      markLocalMessageFailed(clientMsgId)
+      return false
+    }
+    if (sendTrace) trackSendTrace(clientMsgId, sendTrace)
     await nextTick()
     scrollMessagesToBottom()
     return true
@@ -1300,6 +1367,10 @@ export function useImRuntime(
     }
     if (packet.cmd === 'send_ack') {
       const message = packet.data?.message as ImPacketMessage | undefined
+      const clientMsgId = String(
+        packet.client_msg_id ?? packet.data?.client_msg_id ?? message?.client_msg_id ?? ''
+      )
+      finishSendTrace(clientMsgId)
       if (message) {
         upsertIncomingMessage(message)
       }
@@ -1380,10 +1451,14 @@ export function useImRuntime(
         sessionId !== ''
     )
     if (!valid || !challenge) {
+      challenge?.traceSpan?.fail({
+        code: 'IM_AUTH_ACK_REJECTED',
+        type: 'protocol_error'
+      })
       logWsStatus('auth-ack:invalid', {
         packetOrganization: packet.organization ?? null,
-        clientId,
-        challengeClientId: challenge?.clientId ?? '',
+        hasClientId: clientId !== '',
+        challengeHasClientId: Boolean(challenge?.clientId),
         hasCredentialSessionId: credentialSessionId !== '',
         hasSessionId: sessionId !== ''
       })
@@ -1404,9 +1479,10 @@ export function useImRuntime(
     }
     pendingAuthChallenge = null
     connectionState.value = 'connected'
+    challenge.traceSpan?.end()
     logWsStatus('connected:auth-ack', {
-      clientId,
-      sessionId
+      hasClientId: true,
+      hasSessionId: true
     })
     startPing()
     void loadConversations()
@@ -1417,6 +1493,7 @@ export function useImRuntime(
     const code = String(packet.data?.code ?? '')
     const clientMsgId = String(packet.client_msg_id ?? packet.data?.client_msg_id ?? '')
     if (clientMsgId !== '') {
+      finishSendTrace(clientMsgId, code || 'IM_COMMAND_ERROR')
       markLocalMessageFailed(clientMsgId)
     }
     if (code === 'CONVERSATION_MEMBER_MUTED') {
@@ -1810,13 +1887,13 @@ export function useImRuntime(
     return document.hidden || !document.hasFocus()
   }
 
-  function sendPacketToSocket(target: WebSocket, packet: ImPacket) {
+  function sendPacketToSocket(target: WebSocket, packet: ImPacket, traceContext?: TraceContext) {
     if (target.readyState !== WebSocket.OPEN) return false
-    target.send(JSON.stringify({ ...packet, ts: Date.now() }))
+    target.send(JSON.stringify(attachTraceContext({ ...packet, ts: Date.now() }, traceContext)))
     return true
   }
 
-  function sendPacket(packet: ImPacket) {
+  function sendPacket(packet: ImPacket, retainedSpan?: TelemetrySpan | null) {
     const current = socket
     if (
       !current ||
@@ -1826,7 +1903,22 @@ export function useImRuntime(
     ) {
       return false
     }
-    return sendPacketToSocket(current, packet)
+    if (packet.cmd === 'ping') return sendPacketToSocket(current, packet)
+
+    const ownedSpan = retainedSpan === undefined
+      ? startWsSpan(packet.cmd, packetTraceContext(packet), packet.client_msg_id)
+      : null
+    const span = retainedSpan ?? ownedSpan
+    const sent = sendPacketToSocket(current, packet, span?.context)
+    if (ownedSpan) {
+      if (sent) ownedSpan.end()
+      else ownedSpan.fail({
+        code: 'IM_WEBSOCKET_SEND_FAILED',
+        type: 'connection_unavailable',
+        ...(packet.client_msg_id ? { clientMsgId: packet.client_msg_id } : {})
+      })
+    }
+    return sent
   }
 
   function isCurrentChallenge(challenge: AuthChallengeState) {
@@ -1841,6 +1933,10 @@ export function useImRuntime(
 
   function clearSocketAuthState(target?: WebSocket) {
     if (!target || pendingAuthChallenge?.socket === target) {
+      pendingAuthChallenge?.traceSpan?.fail({
+        code: 'IM_AUTH_CONNECTION_CLOSED',
+        type: 'connection_closed'
+      })
       pendingAuthChallenge = null
     }
     if (!target || authenticatedConnection?.socket === target) {
@@ -1850,7 +1946,11 @@ export function useImRuntime(
 
   function failSocketAuthentication(target: WebSocket, status: string, message: string) {
     if (socket !== target) return
-    logWsStatus(status, { message })
+    pendingAuthChallenge?.traceSpan?.fail({
+      code: status,
+      type: 'authentication_error'
+    })
+    logWsStatus(status)
     connectionState.value = 'error'
     layer.error(message)
     closeSocket()
@@ -1884,6 +1984,7 @@ export function useImRuntime(
     clearReconnect()
     window.clearInterval(pingTimer)
     pingTimer = 0
+    failPendingSendTraces('IM_WEBSOCKET_CLOSED', 'connection_closed')
     clearSocketAuthState()
     if (socket) {
       const current = socket
@@ -1918,6 +2019,7 @@ export function useImRuntime(
   onScopeDispose(() => {
     window.removeEventListener('focus', markActiveConversationReadWhenVisible)
     document.removeEventListener('visibilitychange', markActiveConversationReadWhenVisible)
+    closeSocket()
   })
 
   return {
