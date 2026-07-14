@@ -99,7 +99,12 @@ function normalizeBaseUrl(value: string) {
 }
 
 function normalizeHost(value: string) {
-  return value.trim().toLowerCase()
+  let host = value.trim().toLowerCase()
+  // www 与 @ 同为网站主入口：发现时与后端一致剥掉前导 www.
+  if (host.startsWith('www.')) {
+    host = host.slice(4)
+  }
+  return host
 }
 
 export function normalizeEnterpriseCode(value: string) {
