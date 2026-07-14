@@ -2,14 +2,8 @@
 
 FROM node:24-alpine AS build
 
-ARG VITE_ROUTING_PUBLIC_KEYS="{}"
-ARG VITE_PLATFORM_DEFAULT_HOSTS=""
-
-# 必须加引号：JSON 的 {} 与逗号分隔 host 在 ENV 展开时否则会被截断/污染
 ENV PNPM_HOME=/pnpm \
-    PATH=/pnpm:$PATH \
-    VITE_ROUTING_PUBLIC_KEYS="$VITE_ROUTING_PUBLIC_KEYS" \
-    VITE_PLATFORM_DEFAULT_HOSTS="$VITE_PLATFORM_DEFAULT_HOSTS"
+    PATH=/pnpm:$PATH
 
 RUN corepack enable && corepack prepare pnpm@11.5.1 --activate
 
@@ -20,10 +14,12 @@ RUN --mount=type=cache,id=b8im-pnpm-store,target=/pnpm/store,sharing=locked \
     pnpm config set store-dir /pnpm/store \
     && pnpm fetch --frozen-lockfile
 
+# 构建上下文可包含 .env.production.local（由 scripts/build-images.sh 写入，gitignore）
 COPY . /app
 RUN --mount=type=cache,id=b8im-pnpm-store,target=/pnpm/store,sharing=locked \
     pnpm config set store-dir /pnpm/store \
     && pnpm install --offline --frozen-lockfile \
+    && if [ -f .env.production.local ]; then echo "using .env.production.local:"; cat .env.production.local; else echo "no .env.production.local"; fi \
     && pnpm run build
 
 FROM nginx:1.28-alpine AS runtime
