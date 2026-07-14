@@ -6,6 +6,8 @@
 .env
 .env.*
 !.env.example
+# scripts/build-images.sh 写入，供 Vite production 构建注入平台入口与线路公钥
+!.env.production.local
 Dockerfile*
 node_modules
 dist

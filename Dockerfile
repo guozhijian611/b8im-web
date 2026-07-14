@@ -14,13 +14,20 @@ RUN --mount=type=cache,id=b8im-pnpm-store,target=/pnpm/store,sharing=locked \
     pnpm config set store-dir /pnpm/store \
     && pnpm fetch --frozen-lockfile
 
-# 构建上下文可包含 .env.production.local（由 scripts/build-images.sh 写入，gitignore）
+# 构建上下文可包含 .env.production.local（由 scripts/build-images.sh 写入；dockerignore 必须放行）
 COPY . /app
 RUN --mount=type=cache,id=b8im-pnpm-store,target=/pnpm/store,sharing=locked \
     pnpm config set store-dir /pnpm/store \
     && pnpm install --offline --frozen-lockfile \
-    && if [ -f .env.production.local ]; then echo "using .env.production.local:"; cat .env.production.local; else echo "no .env.production.local"; fi \
-    && pnpm run build
+    && if [ -f .env.production.local ]; then \
+         echo "using .env.production.local:"; \
+         cat .env.production.local; \
+       else \
+         echo "ERROR: missing .env.production.local (check .dockerignore !.env.production.local)" >&2; \
+         exit 1; \
+       fi \
+    && pnpm run build \
+    && node -e 'const fs=require("fs");const f=fs.readdirSync("dist/assets").find(x=>/^index-.*\\.js$/.test(x));if(!f){console.error("no index js");process.exit(2)}const s=fs.readFileSync("dist/assets/"+f,"utf8");const m=s.match(/\{BASE_URL:"\\/"[^}]*\}/);if(!m){console.error("no env object");process.exit(3)}if(!/idev\\.love|VITE_PLATFORM_DEFAULT_HOSTS/.test(s)){console.error("missing platform hosts",m[0]);process.exit(4)}if(!/routing-test-|VITE_ROUTING_PUBLIC_KEYS/.test(s)&&m[0].length<80){console.error("missing routing keys",m[0]);process.exit(5)}console.log("post-build ok",f,m[0].slice(0,180))'
 
 FROM nginx:1.28-alpine AS runtime
 
