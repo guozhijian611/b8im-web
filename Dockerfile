@@ -27,11 +27,7 @@ RUN --mount=type=cache,id=b8im-pnpm-store,target=/pnpm/store,sharing=locked \
          exit 1; \
        fi \
     && pnpm run build \
-    && js="$(ls dist/assets/index-*.js | head -n1)" \
-    && test -n "$js" \
-    && grep -q 'idev.love' "$js" \
-    && grep -q 'routing-test-20260713' "$js" \
-    && echo "post-build asset check ok: $js"
+    && node scripts/verify-production-env.mjs
 
 FROM nginx:1.28-alpine AS runtime
 
