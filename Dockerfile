@@ -27,7 +27,11 @@ RUN --mount=type=cache,id=b8im-pnpm-store,target=/pnpm/store,sharing=locked \
          exit 1; \
        fi \
     && pnpm run build \
-    && node -e 'const fs=require("fs");const f=fs.readdirSync("dist/assets").find(x=>/^index-.*\\.js$/.test(x));if(!f){console.error("no index js");process.exit(2)}const s=fs.readFileSync("dist/assets/"+f,"utf8");const m=s.match(/\{BASE_URL:"\\/"[^}]*\}/);if(!m){console.error("no env object");process.exit(3)}if(!/idev\\.love|VITE_PLATFORM_DEFAULT_HOSTS/.test(s)){console.error("missing platform hosts",m[0]);process.exit(4)}if(!/routing-test-|VITE_ROUTING_PUBLIC_KEYS/.test(s)&&m[0].length<80){console.error("missing routing keys",m[0]);process.exit(5)}console.log("post-build ok",f,m[0].slice(0,180))'
+    && js="$(ls dist/assets/index-*.js | head -n1)" \
+    && test -n "$js" \
+    && grep -q 'idev.love' "$js" \
+    && grep -q 'routing-test-20260713' "$js" \
+    && echo "post-build asset check ok: $js"
 
 FROM nginx:1.28-alpine AS runtime
 
