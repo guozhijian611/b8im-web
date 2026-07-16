@@ -25,5 +25,7 @@ export const API_PATHS = {
   fileMediaFolderSave: '/saimulti/web/file-media/folderSave',
   fileMediaItemIndex: '/saimulti/web/file-media/itemIndex',
   fileMediaItemSave: '/saimulti/web/file-media/itemSave',
-  fileMediaItemDestroy: '/saimulti/web/file-media/itemDestroy'
+  fileMediaItemDestroy: '/saimulti/web/file-media/itemDestroy',
+  searchMessagesFull: '/saimulti/web/search/messages',
+  searchIndexStatus: '/saimulti/web/search/indexStatus'
 } as const
