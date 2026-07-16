@@ -9,5 +9,7 @@ export const API_PATHS = {
   favoriteList: '/saimulti/web/favorite/index',
   favoriteRead: '/saimulti/web/favorite/read',
   favoriteSave: '/saimulti/web/favorite/save',
-  favoriteDestroy: '/saimulti/web/favorite/destroy'
+  favoriteDestroy: '/saimulti/web/favorite/destroy',
+  stickerPacks: '/saimulti/web/sticker/packs',
+  stickerItems: '/saimulti/web/sticker/items'
 } as const
