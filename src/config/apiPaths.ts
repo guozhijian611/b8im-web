@@ -11,5 +11,9 @@ export const API_PATHS = {
   favoriteSave: '/saimulti/web/favorite/save',
   favoriteDestroy: '/saimulti/web/favorite/destroy',
   stickerPacks: '/saimulti/web/sticker/packs',
-  stickerItems: '/saimulti/web/sticker/items'
+  stickerItems: '/saimulti/web/sticker/items',
+  customerServiceConversationList: '/saimulti/web/customer-service/conversation/index',
+  customerServiceConversationRead: '/saimulti/web/customer-service/conversation/read',
+  customerServiceConversationSave: '/saimulti/web/customer-service/conversation/save',
+  customerServiceEntryResolve: '/saimulti/public/customer-service/entry/resolve'
 } as const
