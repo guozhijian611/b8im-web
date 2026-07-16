@@ -14,6 +14,9 @@ import { requestWebApi, requestWebApiWithUpload } from './apiClient'
 import type { TenantBrandConfig } from './tenantConfig'
 import { formatImTime } from './time'
 import type { TraceContext } from './telemetry'
+import { getWebDeviceId } from './webDevice'
+
+export { getWebDeviceId } from './webDevice'
 
 interface WebImUserPayload {
   id?: string | number
@@ -162,17 +165,6 @@ const privateAssetUrlCache = new Map<string, CachedAssetUrl>()
 
 const firstText = (value: string) => (value.trim().slice(0, 1) || '用').toUpperCase()
 
-const createRuntimeDeviceId = () => {
-  const randomValue =
-    typeof window.crypto?.randomUUID === 'function'
-      ? window.crypto.randomUUID()
-      : `${Date.now()}-${Math.random().toString(16).slice(2)}`
-
-  return `web-${randomValue.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 40)}`
-}
-
-const runtimeDeviceId = createRuntimeDeviceId()
-
 function decodeJwtPayload(token: string): Record<string, unknown> {
   const parts = token.split('.')
   if (parts.length !== 3 || parts.some((part) => part === '')) throw new Error('凭证格式无效')
@@ -204,6 +196,7 @@ function assertWebApiJwtContext(token: string, config: TenantBrandConfig) {
     String(payload.iss ?? '') !== config.deploymentId ||
     String(payload.deployment_id ?? '') !== config.deploymentId ||
     !audiences.includes('web-api') ||
+    String(payload.device_id ?? '') !== getWebDeviceId() ||
     !Number.isSafeInteger(expiresAt) ||
     expiresAt <= Math.floor(Date.now() / 1000)
   ) {
@@ -280,10 +273,6 @@ function assertResourceUrl(value: string, base?: string) {
   return url.toString()
 }
 
-export function getWebDeviceId() {
-  return runtimeDeviceId
-}
-
 function normalizeWindowSession(session: WebImSession): WebImSession {
   return {
     accessToken: String(session.accessToken ?? ''),
@@ -303,7 +292,8 @@ function isValidSession(session: WebImSession, config: TenantBrandConfig) {
     session.organization === config.organization &&
     session.deploymentId === config.deploymentId &&
     session.apiServerUrl === config.serverInfo.apiServerUrl &&
-    session.imServerUrl === config.serverInfo.imServerUrl
+    session.imServerUrl === config.serverInfo.imServerUrl &&
+    String(decodeJwtPayload(session.accessToken).device_id ?? '') === getWebDeviceId()
   )
 }
 
