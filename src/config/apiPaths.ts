@@ -27,5 +27,14 @@ export const API_PATHS = {
   fileMediaItemSave: '/saimulti/web/file-media/itemSave',
   fileMediaItemDestroy: '/saimulti/web/file-media/itemDestroy',
   searchMessagesFull: '/saimulti/web/search/messages',
-  searchIndexStatus: '/saimulti/web/search/indexStatus'
+  searchIndexStatus: '/saimulti/web/search/indexStatus',
+  momentsFeed: '/saimulti/web/moments/feed',
+  momentsRead: '/saimulti/web/moments/read',
+  momentsSave: '/saimulti/web/moments/save',
+  momentsDestroy: '/saimulti/web/moments/destroy',
+  momentsCommentIndex: '/saimulti/web/moments/commentIndex',
+  momentsCommentSave: '/saimulti/web/moments/commentSave',
+  momentsLikeToggle: '/saimulti/web/moments/likeToggle',
+  momentsProfileRead: '/saimulti/web/moments/profileRead',
+  momentsProfileUpdate: '/saimulti/web/moments/profileUpdate'
 } as const
