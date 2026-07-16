@@ -16,6 +16,8 @@ export interface WebApiOptions {
   method?: 'GET' | 'POST'
   body?: Record<string, unknown> | FormData
   token?: string
+  /** Customer-service external visitor guest token (sent as X-CS-Guest-Token). */
+  guestToken?: string
   query?: Record<string, string | number | undefined>
   traceContext?: TraceContext
 }
@@ -95,6 +97,7 @@ export async function requestWebApi<T>(
     'App-Id': config.organization
   })
   if (options.token) headers.set('Authorization', `Bearer ${options.token}`)
+  if (options.guestToken) headers.set('X-CS-Guest-Token', options.guestToken)
 
   const init: RequestInit = {
     method,
