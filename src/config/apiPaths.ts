@@ -18,5 +18,12 @@ export const API_PATHS = {
   customerServiceEntryResolve: '/saimulti/public/customer-service/entry/resolve',
   robotSingleList: '/saimulti/web/robot-single/index',
   robotSingleRead: '/saimulti/web/robot-single/read',
-  robotSingleMatch: '/saimulti/web/robot-single/match'
+  robotSingleMatch: '/saimulti/web/robot-single/match',
+  fileMediaUsage: '/saimulti/web/file-media/usage',
+  fileMediaCheckUpload: '/saimulti/web/file-media/checkUpload',
+  fileMediaFolderIndex: '/saimulti/web/file-media/folderIndex',
+  fileMediaFolderSave: '/saimulti/web/file-media/folderSave',
+  fileMediaItemIndex: '/saimulti/web/file-media/itemIndex',
+  fileMediaItemSave: '/saimulti/web/file-media/itemSave',
+  fileMediaItemDestroy: '/saimulti/web/file-media/itemDestroy'
 } as const
