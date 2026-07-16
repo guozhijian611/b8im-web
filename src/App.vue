@@ -261,23 +261,41 @@ async function handleLogin(payload: { enterpriseCode: string; username: string; 
       account: payload.username.trim(),
       password: payload.password
     })
-    if (session.organization !== config.organization) {
-      throw new Error('登录 organization 与发现上下文不一致')
-    }
-    saveWebSession(session)
-    webSession.value = session
-    account.value = {
-      org: session.organization,
-      username: session.user.nickname || session.user.account
-    }
-    await loadClientConfig()
-    if (route.value.kind === 'view' && route.value.view !== 'announcement') {
-      activeView.value = route.value.view
-    }
+    await completeWebAuthentication(config, session)
   } catch (error) {
     layer.error(error instanceof Error ? error.message : '登录失败，请稍后重试')
   } finally {
     isLoggingIn.value = false
+  }
+}
+
+async function completeWebAuthentication(config: TenantBrandConfig, session: WebImSession) {
+  if (
+    session.organization !== config.organization ||
+    session.deploymentId !== config.deploymentId ||
+    session.apiServerUrl !== config.serverInfo.apiServerUrl ||
+    session.imServerUrl !== config.serverInfo.imServerUrl
+  ) {
+    throw new Error('认证会话与当前部署或机构不一致')
+  }
+
+  saveWebSession(session)
+  webSession.value = session
+  account.value = {
+    org: session.organization,
+    username: session.user.nickname || session.user.account
+  }
+  await loadClientConfig()
+  if (route.value.kind === 'view' && route.value.view !== 'announcement') {
+    activeView.value = route.value.view
+  }
+}
+
+async function handleAuthenticated(session: WebImSession) {
+  try {
+    await completeWebAuthentication(tenantConfig.value, session)
+  } catch (error) {
+    layer.error(error instanceof Error ? error.message : '认证失败，请稍后重试')
   }
 }
 
@@ -394,6 +412,7 @@ onBeforeUnmount(() => {
       :tenant-error="tenantConfigError"
       @enterprise-code-change="handleEnterpriseCodeChange"
       @login="handleLogin"
+      @authenticated="handleAuthenticated"
     />
     <StatePanel
       v-else-if="directAnnouncementGuard === 'loading'"

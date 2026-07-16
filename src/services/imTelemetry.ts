@@ -16,7 +16,10 @@ export function attachTraceContext<T extends TraceableImPacket>(packet: T, conte
 }
 
 export class PendingSendTraceRegistry {
-  private readonly pending = new Map<string, { span: TelemetrySpan; timeout: number }>()
+  private readonly pending = new Map<
+    string,
+    { span: TelemetrySpan; timeout: ReturnType<typeof globalThis.setTimeout> }
+  >()
   private readonly timeoutMs: number
   private readonly onTimeout: (clientMsgId: string) => void
 

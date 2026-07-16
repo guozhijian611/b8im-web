@@ -115,7 +115,8 @@ button {
 .login-card {
   position: relative;
   width: min(960px, 100%);
-  height: 620px;
+  height: min(700px, calc(100vh - 104px));
+  min-height: 620px;
   display: grid;
   grid-template-columns: 0.95fr 1fr;
   background: #fff;
@@ -184,7 +185,7 @@ button {
 }
 
 .login-form-panel {
-  padding: 64px 64px 48px;
+  padding: 42px 56px 36px;
   display: flex;
   flex-direction: column;
   min-width: 0;
@@ -195,7 +196,7 @@ button {
   align-self: flex-start;
   gap: 4px;
   padding: 4px;
-  margin-bottom: 36px;
+  margin-bottom: 22px;
   border-radius: 8px;
   background: #f3f5f6;
 }
@@ -220,6 +221,7 @@ button {
 .login-form {
   display: grid;
   gap: 18px;
+  width: 100%;
   align-self: start;
 }
 
@@ -227,9 +229,12 @@ button {
   flex: 1;
   min-height: 0;
   display: grid;
+  overflow-y: auto;
+  padding: 2px 4px 2px 0;
 }
 
-.login-form label {
+.login-form label,
+.tenant-context label {
   display: grid;
   gap: 8px;
   color: var(--muted);
@@ -237,6 +242,7 @@ button {
 }
 
 .login-form input,
+.tenant-context input,
 .search-box input,
 .composer textarea {
   width: 100%;
@@ -254,7 +260,17 @@ button {
   font-size: 15px;
 }
 
-.login-form input:disabled {
+.tenant-context input {
+  height: 42px;
+  padding: 0 14px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: #fafbfc;
+  font-size: 15px;
+}
+
+.login-form input:disabled,
+.tenant-context input:disabled {
   color: #697586;
   background: #eef1f3;
 }
@@ -284,6 +300,232 @@ button {
   color: var(--muted);
   text-align: center;
   font-size: 13px;
+}
+
+.tenant-context {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 18px;
+}
+
+.login-text-action,
+.register-form-heading button {
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: var(--green-dark);
+  font: inherit;
+  cursor: pointer;
+}
+
+.login-text-action:hover,
+.register-form-heading button:hover {
+  text-decoration: underline;
+}
+
+.register-form {
+  gap: 14px;
+}
+
+.register-form-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  padding-bottom: 2px;
+}
+
+.register-form-heading > div {
+  display: grid;
+  gap: 4px;
+}
+
+.register-form-heading strong {
+  color: var(--text);
+  font-size: 17px;
+}
+
+.register-form-heading span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.register-form-heading button {
+  flex: 0 0 auto;
+  padding-top: 2px;
+  font-size: 13px;
+}
+
+.register-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.register-form input {
+  height: 40px;
+  font-size: 14px;
+}
+
+.login-form input[aria-invalid="true"] {
+  border-color: rgba(220, 38, 38, 0.68);
+  background: rgba(254, 242, 242, 0.72);
+}
+
+.field-error,
+.auth-form-error {
+  color: var(--danger);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.auth-form-error {
+  margin: 0;
+  text-align: center;
+}
+
+.captcha-field {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 132px;
+  gap: 10px;
+}
+
+.captcha-field button {
+  height: 40px;
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 0;
+  background: #f2f3f5;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.captcha-field button:disabled {
+  cursor: wait;
+  opacity: 0.68;
+}
+
+.captcha-field img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.qr-login-panel {
+  align-content: start;
+  justify-items: center;
+  gap: 16px;
+  padding-top: 4px;
+  text-align: center;
+}
+
+.qr-code-shell {
+  position: relative;
+  width: 252px;
+  height: 252px;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 13px;
+  background: #fff;
+  box-shadow: 0 12px 28px rgba(31, 42, 55, 0.08);
+}
+
+.qr-code-shell canvas {
+  width: 224px !important;
+  height: 224px !important;
+}
+
+.qr-code-placeholder {
+  width: 100%;
+  height: 100%;
+  display: grid;
+  place-items: center;
+  border-radius: 7px;
+  background: #f4f7f6;
+  color: #a0aab5;
+}
+
+.qr-code-shell.is-creating .qr-code-placeholder {
+  color: var(--green-dark);
+}
+
+.qr-code-overlay {
+  position: absolute;
+  inset: 13px;
+  display: grid;
+  place-items: center;
+  border-radius: 7px;
+  background: rgba(255, 255, 255, 0.84);
+  color: var(--green-dark);
+}
+
+.qr-code-overlay.terminal {
+  color: var(--muted);
+  background: rgba(244, 247, 246, 0.94);
+}
+
+.qr-status {
+  min-height: 48px;
+  display: grid;
+  gap: 5px;
+}
+
+.qr-status strong {
+  color: var(--text);
+  font-size: 16px;
+}
+
+.qr-status span,
+.qr-security-note {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.qr-actions {
+  min-height: 34px;
+  display: flex;
+  justify-content: center;
+  gap: 10px;
+}
+
+.qr-actions button {
+  min-height: 34px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 0 14px;
+  background: #fff;
+  color: var(--text);
+  cursor: pointer;
+}
+
+.qr-actions button:hover {
+  border-color: rgba(37, 192, 109, 0.42);
+  color: var(--green-dark);
+  background: #f5fbf8;
+}
+
+.qr-security-note {
+  margin: 0;
+  line-height: 1.6;
+}
+
+.login-tabs button:focus-visible,
+.login-text-action:focus-visible,
+.register-form-heading button:focus-visible,
+.captcha-field button:focus-visible,
+.qr-actions button:focus-visible {
+  outline: 2px solid rgba(37, 192, 109, 0.42);
+  outline-offset: 2px;
 }
 
 .download-links {
@@ -4531,6 +4773,11 @@ button {
     overflow: auto;
   }
 
+  .login-page {
+    place-items: start center;
+    padding-bottom: 24px;
+  }
+
   .login-card {
     grid-template-columns: 1fr;
     height: auto;
@@ -4552,6 +4799,16 @@ button {
 
   .login-mode-body {
     min-height: 356px;
+    overflow: visible;
+  }
+
+  .register-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .login-footer {
+    position: static;
+    margin-top: 24px;
   }
 
   .agreement-page {
@@ -4594,13 +4851,47 @@ button {
   }
 }
 
-.login-tabs strong {
-  padding: 10px 22px;
-  border-radius: 6px;
-  background: #fff;
-  color: var(--text);
-  box-shadow: 0 1px 6px rgba(0, 0, 0, 0.08);
-  font-size: 14px;
+@media (max-width: 480px) {
+  .login-page {
+    padding: 16px;
+  }
+
+  .login-brand {
+    padding: 28px 22px;
+  }
+
+  .login-brand h1 {
+    font-size: 30px;
+  }
+
+  .login-form-panel {
+    padding: 28px 20px;
+  }
+
+  .login-tabs {
+    width: 100%;
+  }
+
+  .login-tabs button {
+    flex: 1;
+    padding-inline: 12px;
+  }
+
+  .captcha-field {
+    grid-template-columns: minmax(0, 1fr) 116px;
+  }
+
+  .qr-code-shell {
+    width: min(252px, 100%);
+    height: auto;
+    aspect-ratio: 1;
+  }
+
+  .qr-code-shell canvas {
+    max-width: 100%;
+    height: auto !important;
+    aspect-ratio: 1;
+  }
 }
 
 .tenant-discovery-status {
@@ -4876,8 +5167,7 @@ button {
   overflow-wrap: anywhere;
 }
 
-:root[data-web-theme="dark"] .login-tabs,
-:root[data-web-theme="dark"] .login-tabs strong {
+:root[data-web-theme="dark"] .login-tabs {
   background: #233041;
 }
 
