@@ -15,5 +15,8 @@ export const API_PATHS = {
   customerServiceConversationList: '/saimulti/web/customer-service/conversation/index',
   customerServiceConversationRead: '/saimulti/web/customer-service/conversation/read',
   customerServiceConversationSave: '/saimulti/web/customer-service/conversation/save',
-  customerServiceEntryResolve: '/saimulti/public/customer-service/entry/resolve'
+  customerServiceEntryResolve: '/saimulti/public/customer-service/entry/resolve',
+  robotSingleList: '/saimulti/web/robot-single/index',
+  robotSingleRead: '/saimulti/web/robot-single/read',
+  robotSingleMatch: '/saimulti/web/robot-single/match'
 } as const
