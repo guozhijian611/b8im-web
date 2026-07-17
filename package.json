@@ -12,14 +12,17 @@
     "test:telemetry": "node --experimental-strip-types --test tests/telemetry.test.ts tests/apiTelemetry.test.ts tests/imTelemetry.test.ts",
     "test:web-device": "node --experimental-strip-types --test tests/webDevice.test.ts",
     "test:client-modules": "node --experimental-strip-types --test tests/clientModules.test.ts",
+    "test:web-auth": "node --experimental-strip-types --test tests/webAuth.test.ts tests/webAuthValidation.test.ts",
     "build": "vue-tsc --noEmit && vite build",
     "preview": "vite preview --host 127.0.0.1"
   },
   "dependencies": {
     "@lucide/vue": "^1.21.0",
+    "qrcode": "^1.5.4",
     "vue": "^3.5.21"
   },
   "devDependencies": {
+    "@types/qrcode": "^1.5.6",
     "@vitejs/plugin-vue": "^6.0.1",
     "typescript": "~5.6.3",
     "vite": "^7.1.5",

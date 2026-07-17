@@ -9,14 +9,14 @@ import type {
   UploadedAsset,
   WebImSession,
   WebImUser
-} from '../types'
-import { requestWebApi, requestWebApiWithUpload } from './apiClient'
-import type { TenantBrandConfig } from './tenantConfig'
-import { formatImTime } from './time'
-import type { TraceContext } from './telemetry'
-import { getWebDeviceId } from './webDevice'
+} from '../types.ts'
+import { requestWebApi, requestWebApiWithUpload } from './apiClient.ts'
+import type { TenantBrandConfig } from './tenantConfig.ts'
+import { formatImTime } from './time.ts'
+import type { TraceContext } from './telemetry.ts'
+import { getWebDeviceId } from './webDevice.ts'
 
-export { getWebDeviceId } from './webDevice'
+export { getWebDeviceId } from './webDevice.ts'
 
 interface WebImUserPayload {
   id?: string | number
@@ -49,6 +49,34 @@ interface WebImLoginPayload {
   }
   user: WebImUserPayload
 }
+
+export interface WebAccountPolicy {
+  registerEnabled: boolean
+}
+
+export interface WebCaptcha {
+  uuid: string
+  image: string
+}
+
+export type QrLoginStatus =
+  | 'pending'
+  | 'scanned'
+  | 'confirmed'
+  | 'expired'
+  | 'cancelled'
+  | 'consumed'
+
+export interface QrLoginSessionSecret {
+  qrId: string
+  browserToken: string
+  qrContent: string
+  expiresAt: number
+}
+
+export type QrLoginPollResult =
+  | { status: Exclude<QrLoginStatus, 'confirmed'>; session: null }
+  | { status: 'confirmed'; session: WebImSession }
 
 interface ImTokenResponse {
   token?: string
@@ -286,6 +314,34 @@ function normalizeWindowSession(session: WebImSession): WebImSession {
   }
 }
 
+function normalizeAuthenticatedSession(
+  config: TenantBrandConfig,
+  data: WebImLoginPayload,
+  responseName: string
+): WebImSession {
+  if (String(data.organization ?? '') !== config.organization) {
+    throw new Error(`${responseName}的 organization 与发现上下文不一致`)
+  }
+  if (data.deployment_id !== config.deploymentId) {
+    throw new Error(`${responseName}的 deployment_id 与发现上下文不一致`)
+  }
+
+  const accessToken = String(data.token?.access_token ?? '')
+  if (!accessToken) throw new Error(`${responseName}缺少 access token`)
+  assertWebApiJwtContext(accessToken, config)
+
+  return normalizeWindowSession({
+    accessToken,
+    refreshToken: data.token?.refresh_token || '',
+    expiresIn: Number(data.token?.expires_in ?? 0),
+    organization: config.organization,
+    deploymentId: config.deploymentId,
+    apiServerUrl: config.serverInfo.apiServerUrl,
+    imServerUrl: config.serverInfo.imServerUrl,
+    user: mapWebImUser(data.user)
+  })
+}
+
 function isValidSession(session: WebImSession, config: TenantBrandConfig) {
   return Boolean(
     session.accessToken &&
@@ -371,26 +427,137 @@ export async function loginWebIm(
     }
   })
 
-  if (String(data.organization ?? '') !== config.organization) {
-    throw new Error('登录响应的 organization 与发现上下文不一致')
-  }
-  if (data.deployment_id !== config.deploymentId) {
-    throw new Error('登录响应的 deployment_id 与发现上下文不一致')
-  }
+  return normalizeAuthenticatedSession(config, data, '登录响应')
+}
 
-  const accessToken = String(data.token.access_token ?? '')
-  if (!accessToken) throw new Error('登录响应缺少 access token')
-  assertWebApiJwtContext(accessToken, config)
+export async function fetchWebAccountPolicy(config: TenantBrandConfig): Promise<WebAccountPolicy> {
+  const data = await requestWebApi<{ register_enabled?: unknown }>(
+    config,
+    '/saimulti/web/im/accountPolicy'
+  )
+  if (typeof data.register_enabled !== 'boolean') {
+    throw new Error('账号策略 register_enabled 格式无效')
+  }
+  return { registerEnabled: data.register_enabled }
+}
 
-  return normalizeWindowSession({
-    accessToken,
-    refreshToken: data.token.refresh_token || '',
-    expiresIn: Number(data.token.expires_in ?? 0),
-    organization: config.organization,
-    deploymentId: config.deploymentId,
-    apiServerUrl: config.serverInfo.apiServerUrl,
-    imServerUrl: config.serverInfo.imServerUrl,
-    user: mapWebImUser(data.user)
+export async function fetchWebCaptcha(config: TenantBrandConfig): Promise<WebCaptcha> {
+  const data = await requestWebApi<{ uuid?: unknown; image?: unknown }>(config, '/saimulti/captcha')
+  const uuid = typeof data.uuid === 'string' ? data.uuid.trim() : ''
+  const image = typeof data.image === 'string' ? data.image.trim() : ''
+  if (!/^[a-f0-9-]{36}$/.test(uuid) || !/^data:image\/png;base64,[a-zA-Z0-9+/=]+$/.test(image)) {
+    throw new Error('验证码响应格式无效')
+  }
+  return { uuid, image }
+}
+
+export async function registerWebIm(
+  config: TenantBrandConfig,
+  payload: {
+    account: string
+    nickname: string
+    password: string
+    passwordConfirm: string
+    uuid: string
+    code: string
+  }
+): Promise<WebImSession> {
+  const data = await requestWebApi<WebImLoginPayload>(config, '/saimulti/web/im/register', {
+    method: 'POST',
+    body: {
+      account: payload.account,
+      nickname: payload.nickname,
+      password: payload.password,
+      password_confirm: payload.passwordConfirm,
+      uuid: payload.uuid,
+      code: payload.code,
+      platform: 'web',
+      device_id: getWebDeviceId()
+    }
+  })
+
+  return normalizeAuthenticatedSession(config, data, '注册响应')
+}
+
+export async function createQrLogin(config: TenantBrandConfig): Promise<QrLoginSessionSecret> {
+  const data = await requestWebApi<{
+    qr_id?: unknown
+    browser_token?: unknown
+    qr_content?: unknown
+    expires_at?: unknown
+  }>(config, '/saimulti/web/im/qrLogin/create', {
+    method: 'POST',
+    body: { platform: 'web', device_id: getWebDeviceId() }
+  })
+  const qrId = typeof data.qr_id === 'string' ? data.qr_id.trim() : ''
+  const browserToken = typeof data.browser_token === 'string' ? data.browser_token.trim() : ''
+  const qrContent = typeof data.qr_content === 'string' ? data.qr_content.trim() : ''
+  const expiresAt = Number(data.expires_at ?? 0)
+  if (
+    !qrId ||
+    qrId.length > 128 ||
+    !browserToken ||
+    browserToken.length > 512 ||
+    !qrContent ||
+    qrContent.length > 4096 ||
+    qrContent.includes(browserToken) ||
+    !Number.isSafeInteger(expiresAt) ||
+    expiresAt <= Math.floor(Date.now() / 1000)
+  ) {
+    throw new Error('扫码登录创建响应格式无效')
+  }
+  return { qrId, browserToken, qrContent, expiresAt }
+}
+
+function assertQrLoginStatus(value: unknown): QrLoginStatus {
+  if (
+    value !== 'pending' &&
+    value !== 'scanned' &&
+    value !== 'confirmed' &&
+    value !== 'expired' &&
+    value !== 'cancelled' &&
+    value !== 'consumed'
+  ) {
+    throw new Error('扫码登录状态无效')
+  }
+  return value
+}
+
+export async function pollQrLogin(
+  config: TenantBrandConfig,
+  secret: Pick<QrLoginSessionSecret, 'qrId' | 'browserToken'>
+): Promise<QrLoginPollResult> {
+  const data = await requestWebApi<WebImLoginPayload & { status?: unknown }>(
+    config,
+    '/saimulti/web/im/qrLogin/poll',
+    {
+      method: 'POST',
+      body: {
+        qr_id: secret.qrId,
+        browser_token: secret.browserToken,
+        device_id: getWebDeviceId()
+      }
+    }
+  )
+  const status = assertQrLoginStatus(data.status)
+  if (status !== 'confirmed') return { status, session: null }
+  return {
+    status,
+    session: normalizeAuthenticatedSession(config, data, '扫码登录响应')
+  }
+}
+
+export async function cancelQrLogin(
+  config: TenantBrandConfig,
+  secret: Pick<QrLoginSessionSecret, 'qrId' | 'browserToken'>
+): Promise<void> {
+  await requestWebApi<unknown>(config, '/saimulti/web/im/qrLogin/cancel', {
+    method: 'POST',
+    body: {
+      qr_id: secret.qrId,
+      browser_token: secret.browserToken,
+      device_id: getWebDeviceId()
+    }
   })
 }
 
