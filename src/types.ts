@@ -1,6 +1,17 @@
 import type { Component } from 'vue'
 
-export type PrimaryView = 'chats' | 'contacts' | 'announcement'
+export type ModuleView =
+  | 'announcement'
+  | 'i18n'
+  | 'favorite'
+  | 'sticker'
+  | 'customer_service'
+  | 'robot_single'
+  | 'file_media'
+  | 'search'
+  | 'moments'
+
+export type PrimaryView = 'chats' | 'contacts' | ModuleView
 
 export interface RailItem {
   key: PrimaryView

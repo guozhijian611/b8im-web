@@ -14,7 +14,9 @@ import { WebApiError } from './services/apiClient'
 import {
   CLIENT_MODULE_REGISTRY,
   fetchWebClientConfig,
+  isClientModuleKey,
   isClientModuleAvailable,
+  type ClientModuleKey,
   type WebClientConfig
 } from './services/clientModules'
 import { CONTEXT_MENU_CLOSE_EVENT, emitCloseContextMenus, isCloseFromSource } from './services/contextMenu'
@@ -27,7 +29,7 @@ import {
   type TenantBrandConfig
 } from './services/tenantConfig'
 import { clearWebSession, loadWebSession, loginWebIm, saveWebSession } from './services/webIm'
-import type { PrimaryView, WebImSession } from './types'
+import type { ModuleView, PrimaryView, WebImSession } from './types'
 
 type AgreementRoute = 'userAgreement' | 'privacyPolicy'
 type AppRoute =
@@ -63,15 +65,16 @@ const currentAgreement = computed(() => {
   if (route.value.kind !== 'agreement' || !tenantConfig.value.discovered) return null
   return tenantConfig.value.agreements[route.value.agreement]
 })
-const announcementAvailable = computed(() =>
-  isClientModuleAvailable(clientConfig.value, 'announcement')
-)
-const directAnnouncementGuard = computed(() => {
-  if (!isAuthed.value || route.value.kind !== 'view' || route.value.view !== 'announcement') return null
+const routedModuleKey = computed<ClientModuleKey | null>(() => {
+  if (route.value.kind !== 'view' || !isClientModuleKey(route.value.view)) return null
+  return route.value.view
+})
+const directModuleGuard = computed(() => {
+  if (!isAuthed.value || !routedModuleKey.value) return null
   if (isClientConfigLoading.value) return 'loading'
   if (clientConfigForbidden.value) return 'forbidden'
   if (clientConfigError.value) return 'error'
-  if (!announcementAvailable.value) return 'forbidden'
+  if (!isClientModuleAvailable(clientConfig.value, routedModuleKey.value)) return 'forbidden'
   return null
 })
 
@@ -87,9 +90,8 @@ function resolveRoute(): AppRoute {
   const path = routePath()
   if (!path || path === '/' || path === '/chats') return { kind: 'view', view: 'chats' }
   if (path === '/contacts') return { kind: 'view', view: 'contacts' }
-  if (path === CLIENT_MODULE_REGISTRY.announcement.route) {
-    return { kind: 'view', view: 'announcement' }
-  }
+  const module = Object.values(CLIENT_MODULE_REGISTRY).find((item) => item.route === path)
+  if (module) return { kind: 'view', view: module.moduleKey as ModuleView }
   if (path === '/agreements/user-agreement') return { kind: 'agreement', agreement: 'userAgreement' }
   if (path === '/agreements/privacy-policy') return { kind: 'agreement', agreement: 'privacyPolicy' }
   return { kind: 'not-found' }
@@ -101,11 +103,11 @@ function syncRoute() {
 }
 
 function navigateToView(view: PrimaryView) {
-  const paths: Record<PrimaryView, string> = {
+  const paths = {
     chats: '/chats',
     contacts: '/contacts',
-    announcement: CLIENT_MODULE_REGISTRY.announcement.route
-  }
+    ...Object.fromEntries(Object.values(CLIENT_MODULE_REGISTRY).map((item) => [item.moduleKey, item.route]))
+  } as Record<PrimaryView, string>
   activeView.value = view
   const nextHash = `#${paths[view]}`
   if (window.location.hash !== nextHash) window.location.hash = paths[view]
@@ -271,9 +273,7 @@ async function handleLogin(payload: { enterpriseCode: string; username: string; 
       username: session.user.nickname || session.user.account
     }
     await loadClientConfig()
-    if (route.value.kind === 'view' && route.value.view !== 'announcement') {
-      activeView.value = route.value.view
-    }
+    if (route.value.kind === 'view') activeView.value = route.value.view
   } catch (error) {
     layer.error(error instanceof Error ? error.message : '登录失败，请稍后重试')
   } finally {
@@ -321,9 +321,7 @@ function refreshClientConfigWhenVisible() {
 async function handleClientConfigInvalidated() {
   if (!isAuthed.value || isClientConfigLoading.value) return
   await loadClientConfig()
-  if (route.value.kind === 'view'
-    && route.value.view === 'announcement'
-    && !announcementAvailable.value) {
+  if (routedModuleKey.value && !isClientModuleAvailable(clientConfig.value, routedModuleKey.value)) {
     navigateToView('chats')
   }
 }
@@ -396,13 +394,13 @@ onBeforeUnmount(() => {
       @login="handleLogin"
     />
     <StatePanel
-      v-else-if="directAnnouncementGuard === 'loading'"
+      v-else-if="directModuleGuard === 'loading'"
       kind="loading"
-      title="正在校验公告模块"
+      title="正在校验企业应用"
       description="正在读取当前机构的客户端配置和模块可用投影。"
     />
     <StatePanel
-      v-else-if="directAnnouncementGuard === 'error'"
+      v-else-if="directModuleGuard === 'error'"
       kind="error"
       title="模块配置加载失败"
       :description="clientConfigError"
@@ -410,10 +408,10 @@ onBeforeUnmount(() => {
       @action="loadClientConfig"
     />
     <StatePanel
-      v-else-if="directAnnouncementGuard === 'forbidden'"
+      v-else-if="directModuleGuard === 'forbidden'"
       kind="forbidden"
-      title="公告模块不可用"
-      description="当前机构未启用公告模块，或 Web 客户端能力投影未授权该入口。"
+      title="企业应用不可用"
+      description="当前机构未启用该模块，或 Web 客户端能力投影未授权该入口。"
       action-label="返回消息"
       @action="navigateToView('chats')"
     />

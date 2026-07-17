@@ -1,9 +1,17 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch, watchEffect } from 'vue'
 import {
+  Bot,
+  CircleUserRound,
   ContactRound,
+  FolderOpen,
+  Headphones,
+  Languages,
   Megaphone,
-  MessageCircle
+  MessageCircle,
+  Search,
+  Smile,
+  Star
 } from '@lucide/vue'
 import AnnouncementView from './AnnouncementView.vue'
 import AnnouncementPopup from './AnnouncementPopup.vue'
@@ -13,13 +21,16 @@ import ContactsView from './ContactsView.vue'
 import ConversationList from './ConversationList.vue'
 import InfoPanel from './InfoPanel.vue'
 import LockScreenView from './LockScreenView.vue'
+import ModuleWorkbenchView from './ModuleWorkbenchView.vue'
 import SettingsView from './SettingsView.vue'
 import SideRail from './SideRail.vue'
 import { useImRuntime } from '../composables/useImRuntime'
 import { layer } from '../services/layer'
 import {
+  availableClientTabbar,
   clientModuleTitle,
   isClientModuleAvailable,
+  type ClientModuleKey,
   type WebClientConfig
 } from '../services/clientModules'
 import {
@@ -153,15 +164,25 @@ const railItems = computed<RailItem[]>(() => {
     { key: 'chats', label: '消息', icon: MessageCircle, badge: notifiableUnread.value },
     { key: 'contacts', label: '联系人', icon: ContactRound, badge: friendRequestCount.value }
   ]
-  if (isClientModuleAvailable(props.clientConfig, 'announcement')) {
-    items.push({
-      key: 'announcement',
-      label: clientModuleTitle(props.clientConfig, 'announcement'),
-      icon: Megaphone
-    })
-  }
+  availableClientTabbar(props.clientConfig).forEach(({ moduleKey }) => items.push({
+    key: moduleKey,
+    label: clientModuleTitle(props.clientConfig, moduleKey),
+    icon: moduleIcons[moduleKey]
+  }))
   return items
 })
+
+const moduleIcons = {
+  announcement: Megaphone,
+  i18n: Languages,
+  favorite: Star,
+  sticker: Smile,
+  customer_service: Headphones,
+  robot_single: Bot,
+  file_media: FolderOpen,
+  search: Search,
+  moments: CircleUserRound
+} satisfies Record<ClientModuleKey, typeof Megaphone>
 
 const announcementAvailable = computed(() => isClientModuleAvailable(props.clientConfig, 'announcement'))
 const announcementPopupKey = computed(() => [
@@ -791,6 +812,15 @@ watch(
 
     <template v-else-if="activeView === 'announcement'">
       <AnnouncementView :tenant-config="tenantConfig" :web-session="webSession" />
+    </template>
+
+    <template v-else>
+      <ModuleWorkbenchView
+        :module-key="activeView"
+        :title="clientModuleTitle(clientConfig, activeView)"
+        :tenant-config="tenantConfig"
+        :web-session="webSession"
+      />
     </template>
 
     <div
