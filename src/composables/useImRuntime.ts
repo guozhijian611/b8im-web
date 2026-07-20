@@ -52,6 +52,15 @@ import {
   type GlobalSyncPage,
   validateGlobalSyncPage
 } from '../services/imGlobalSync'
+import {
+  buildConversationSyncMessageProjection,
+  commitConversationSyncPageBatch,
+  isCanonicalConversationSyncMessageId,
+  isConversationSyncChangeBatchValid,
+  normalizeConversationSyncChange,
+  type ConversationSyncChange,
+  type ConversationSyncProjectedMessage
+} from '../services/imConversationSync'
 import { resolveCapturedUploadConversation } from '../services/imUploadTarget'
 import {
   parseTraceContext,
@@ -123,18 +132,6 @@ type AuthenticatedConnectionState = {
   deviceId: string
   credentialSessionId: string
   sessionId: string
-}
-
-type ConversationSyncChange = {
-  conversation_id: string
-  change_seq: number
-  change_type: 'recall' | 'edit' | 'delete_both' | 'delete_self'
-  message_id: string
-  message_seq: number
-  target_organization: string | null
-  target_user_id: string | null
-  payload: Record<string, unknown>
-  create_time?: string
 }
 
 type ConversationSyncPage = {
@@ -492,6 +489,66 @@ function mapPacketMessage(message: ImPacketMessage, currentSession: WebImSession
     meta: message.message_type === MESSAGE_TYPE_FILE || message.message_type === MESSAGE_TYPE_IMAGE || message.message_type === MESSAGE_TYPE_VOICE || message.message_type === MESSAGE_TYPE_VIDEO
       ? formatFileSize(Number(message.content?.size ?? 0))
       : undefined
+  }
+}
+
+function messageTypeNumber(type: Message['type']) {
+  if (type === 'image') return MESSAGE_TYPE_IMAGE
+  if (type === 'file') return MESSAGE_TYPE_FILE
+  if (type === 'voice') return MESSAGE_TYPE_VOICE
+  if (type === 'video') return MESSAGE_TYPE_VIDEO
+  if (type === 'notice') return MESSAGE_TYPE_SYSTEM
+  return MESSAGE_TYPE_TEXT
+}
+
+function canonicalConversationSyncSemantic(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(canonicalConversationSyncSemantic)
+  }
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .filter(([, item]) => item !== undefined)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([key, item]) => [
+          key,
+          canonicalConversationSyncSemantic(item)
+        ])
+    )
+  }
+  return value
+}
+
+function conversationSyncContentSemantic(message: Message) {
+  return JSON.stringify(canonicalConversationSyncSemantic({
+    content: message.content,
+    edit_count: Number(message.editCount ?? 0),
+    edit_time: String(message.editTime ?? ''),
+    file_id: String(message.fileId ?? ''),
+    file_name: String(message.fileName ?? ''),
+    file_size: Number(message.fileSize ?? 0),
+    forward_bundle: message.forwardBundle ?? null,
+    mentions: message.mentions ?? [],
+    quote: message.quote ?? null
+  }))
+}
+
+function conversationSyncProjectedMessage(
+  conversation: ImConversation,
+  message: Message,
+  messageType = messageTypeNumber(message.type)
+): ConversationSyncProjectedMessage {
+  return {
+    conversationId: String(
+      message.conversationId ?? conversation.conversationId
+    ),
+    messageId: String(message.messageId ?? ''),
+    messageSeq: Number(message.messageSeq ?? 0),
+    senderOrganization: message.senderOrganization,
+    senderUserId: message.senderUserId,
+    messageType,
+    side: message.side,
+    contentSemantic: conversationSyncContentSemantic(message)
   }
 }
 
@@ -2181,10 +2238,13 @@ export function useImRuntime(
 
     let previousMessageSequence = request.afterSeq
     const packetMessages: ImPacketMessage[] = []
+    const pageMessageIds = new Set<string>()
     for (const value of data.messages) {
       if (!isRecord(value)) return null
       const messageSequence = Number(value.message_seq ?? 0)
       if (
+        !isCanonicalConversationSyncMessageId(value.message_id) ||
+        pageMessageIds.has(value.message_id) ||
         !isMessageValidForConversation(
           value,
           session().organization,
@@ -2197,74 +2257,73 @@ export function useImRuntime(
         return null
       }
       previousMessageSequence = messageSequence
+      pageMessageIds.add(value.message_id)
       packetMessages.push(value as ImPacketMessage)
     }
+
+    let mappedMessages: Message[]
+    try {
+      mappedMessages = packetMessages.map((message) =>
+        mapPacketMessage(message, session(), conversation)
+      )
+    } catch {
+      return null
+    }
+    const localProjectedMessages = (messages.value[conversation.id] ?? [])
+      .filter(
+        (message) =>
+          typeof message.messageId === 'string' &&
+          message.messageId.length > 0
+      )
+      .map((message) =>
+        conversationSyncProjectedMessage(conversation, message)
+      )
+    const pageProjectedMessages = mappedMessages.map((message, index) =>
+      conversationSyncProjectedMessage(
+        conversation,
+        message,
+        Number(packetMessages[index]?.message_type ?? 0)
+      )
+    )
+    const projectedMessages = buildConversationSyncMessageProjection(
+      localProjectedMessages,
+      pageProjectedMessages
+    )
+    if (!projectedMessages) return null
 
     let previousChangeSequence = request.afterChangeSeq
     const changes: ConversationSyncChange[] = []
     for (const value of data.changes) {
-      if (!isRecord(value) || !isRecord(value.payload)) return null
-      const changeSequence = Number(value.change_seq ?? 0)
-      const messageSequence = Number(value.message_seq ?? 0)
-      const changeType = String(value.change_type ?? '')
-      const targetUserId = value.target_user_id == null
-        ? null
-        : String(value.target_user_id).trim()
-      const targetOrganization = value.target_organization == null
-        ? null
-        : normalizeImOrganization(value.target_organization)
-      const validType = changeType === 'recall' ||
-        changeType === 'edit' ||
-        changeType === 'delete_both' ||
-        changeType === 'delete_self'
-      const validTarget = changeType === 'delete_self'
-        ? isSameImIdentity(
-            targetOrganization,
-            targetUserId,
-            session().organization,
-            session().user.userId
-          )
-        : targetOrganization === null && targetUserId === null
-      const validPayload =
-        (changeType === 'recall' &&
-          value.payload.status === 'recalled') ||
-        (changeType === 'edit' &&
-          isRecord(value.payload.content) &&
-          typeof value.payload.content.text === 'string' &&
-          value.payload.content.text.trim() !== '') ||
-        (changeType === 'delete_both' &&
-          value.payload.scope === 'both') ||
-        (changeType === 'delete_self' &&
-          value.payload.scope === 'self')
       if (
-        String(value.conversation_id ?? '').trim() !==
-          request.conversationId ||
-        !String(value.message_id ?? '').trim() ||
-        !Number.isSafeInteger(messageSequence) ||
-        messageSequence <= 0 ||
-        !Number.isSafeInteger(changeSequence) ||
-        changeSequence <= previousChangeSequence ||
-        changeSequence > nextAfterChangeSeq ||
-        !validType ||
-        !validTarget ||
-        !validPayload
+        !isRecord(value) ||
+        !isCanonicalConversationSyncMessageId(value.message_id)
       ) {
         return null
       }
-      previousChangeSequence = changeSequence
-      changes.push({
-        conversation_id: request.conversationId,
-        change_seq: changeSequence,
-        change_type: changeType,
-        message_id: String(value.message_id),
-        message_seq: messageSequence,
-        target_organization: targetOrganization,
-        target_user_id: targetUserId,
-        payload: value.payload,
-        create_time: typeof value.create_time === 'string'
-          ? value.create_time
-          : undefined
-      } as ConversationSyncChange)
+      const messageId = value.message_id
+      const normalized = normalizeConversationSyncChange(value, {
+        organization: session().organization,
+        userId: session().user.userId,
+        conversation,
+        conversationId: request.conversationId,
+        previousChangeSeq: previousChangeSequence,
+        nextAfterChangeSeq,
+        original: projectedMessages.get(messageId) ?? null
+      })
+      if (!normalized) return null
+      previousChangeSequence = normalized.change_seq
+      changes.push(normalized)
+    }
+    if (!isConversationSyncChangeBatchValid(
+      changes,
+      {
+        organization: session().organization,
+        userId: session().user.userId,
+        conversation
+      },
+      (change) => projectedMessages.get(change.message_id)
+    )) {
+      return null
     }
 
     return {
@@ -2288,12 +2347,6 @@ export function useImRuntime(
     const original = (messages.value[conversation.id] ?? []).find(
       (message) => message.messageId === change.message_id
     )
-    if (
-      original &&
-      Number(original.messageSeq ?? 0) !== change.message_seq
-    ) {
-      throw new Error('会话 SYNC 变更与本地 message_seq 不一致')
-    }
     if (original) {
       if (
         change.change_type === 'recall' ||
@@ -2306,19 +2359,10 @@ export function useImRuntime(
           {}
         )
       } else {
-        if (original.type !== 'text') {
-          throw new Error('会话 SYNC 编辑变更指向非文本消息')
-        }
-        const content = isRecord(change.payload.content)
-          ? change.payload.content
-          : null
-        if (!content || typeof content.text !== 'string') {
-          throw new Error('会话 SYNC 编辑变更缺少文本内容')
-        }
         updateLocalMessage(conversation.id, original.id, {
-          content: content.text,
-          editTime: String(change.payload.edit_time ?? change.create_time ?? ''),
-          editCount: Number(change.payload.edit_count ?? original.editCount ?? 0)
+          content: change.payload.content.text,
+          editTime: change.payload.edit_time,
+          editCount: change.payload.edit_count
         })
       }
     }
@@ -2337,29 +2381,59 @@ export function useImRuntime(
     const mappedMessages = page.messages.map((message) =>
       mapPacketMessage(message, session(), conversation)
     )
-    for (const message of mappedMessages) {
-      appendMessage(conversation.id, message)
-    }
-    for (const change of page.changes) {
-      applyConversationSyncChange(conversation, change)
-    }
-    assertConversationAccessEpochCurrent(epoch)
-    messageCursors.set(conversation.id, page.next_after_seq)
-    conversationChangeCursors.set(
-      mutationCursorKey(conversation.conversationId),
-      page.next_after_change_seq
+    const localProjectedMessages = (messages.value[conversation.id] ?? [])
+      .filter(
+        (message) =>
+          typeof message.messageId === 'string' &&
+          message.messageId.length > 0
+      )
+      .map((message) =>
+        conversationSyncProjectedMessage(conversation, message)
+      )
+    const pageProjectedMessages = mappedMessages.map((message, index) =>
+      conversationSyncProjectedMessage(
+        conversation,
+        message,
+        Number(page.messages[index]?.message_type ?? 0)
+      )
     )
-    conversations.value = conversations.value.map((item) =>
-      item.id === conversation.id
-        ? {
-            ...item,
-            lastChangeSeq: Math.max(
-              Number(item.lastChangeSeq ?? 0),
-              page.next_after_change_seq
-            )
-          }
-        : item
+    const committed = commitConversationSyncPageBatch(
+      localProjectedMessages,
+      pageProjectedMessages,
+      page.changes,
+      {
+        organization: session().organization,
+        userId: session().user.userId,
+        conversation
+      },
+      () => {
+        for (const message of mappedMessages) {
+          appendMessage(conversation.id, message)
+        }
+        for (const change of page.changes) {
+          applyConversationSyncChange(conversation, change)
+        }
+        messageCursors.set(conversation.id, page.next_after_seq)
+        conversationChangeCursors.set(
+          mutationCursorKey(conversation.conversationId),
+          page.next_after_change_seq
+        )
+        conversations.value = conversations.value.map((item) =>
+          item.id === conversation.id
+            ? {
+                ...item,
+                lastChangeSeq: Math.max(
+                  Number(item.lastChangeSeq ?? 0),
+                  page.next_after_change_seq
+                )
+              }
+            : item
+        )
+      }
     )
+    if (!committed) {
+      throw new Error('会话 SYNC 变更 actor、target 或原消息归属无效')
+    }
   }
 
   async function syncConversationFromCursors(conversation: ImConversation) {
