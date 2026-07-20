@@ -3445,8 +3445,21 @@ export function useImRuntime(
       // Canonical Rabbit events are state-changing broadcasts. Missing or
       // malformed event ids and schemas fail closed before any local mutation;
       // ACK/SYNC and other point-to-point commands are not subject to this gate.
+      const canonicalConversation = packet.cmd === 'conversation_read'
+        ? conversations.value.find(
+            (item) =>
+              item.conversationId ===
+                String(packet.data?.conversation_id ?? '').trim()
+          ) ?? null
+        : null
       if (!isCanonicalRealtimeEventPacketValid(
-        packet, session().organization, session().user.userId
+        packet,
+        session().organization,
+        session().user.userId,
+        {
+          conversation: canonicalConversation,
+          currentAccessSnapshotId: currentAccessSnapshotId()
+        }
       )) {
         failSocketAuthentication(
           current,

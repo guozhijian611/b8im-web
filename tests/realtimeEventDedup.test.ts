@@ -69,6 +69,23 @@ const canonicalPacket = (cmd: 'push' | 'recall' | 'edit' | 'delete') => {
   return { cmd, organization: 901, data }
 }
 
+const canonicalConversationReadPacket = () => ({
+  cmd: 'conversation_read' as const,
+  organization: 901,
+  data: {
+    event_id: eventId(901),
+    event_type: 'conversation.read',
+    conversation_id: 'conversation-1',
+    last_read_message_id: 'message-9',
+    last_read_seq: 9,
+    unread_count: 0,
+    user_organization: 902,
+    user_id: 'user_b',
+    time: '2026-07-20 12:00:00',
+    cross_org_access_snapshot_id: '42'
+  }
+})
+
 test('canonical Rabbit events require a valid event id and matching schema', () => {
   for (const cmd of ['push', 'recall', 'edit', 'delete'] as const) {
     const packet = canonicalPacket(cmd)
@@ -119,11 +136,219 @@ test('canonical Rabbit events require a valid event id and matching schema', () 
   assert.equal(isCanonicalRealtimeEventPacketValid(canonicalPacket('push'), '902'), false)
 })
 
+test('conversation read is a canonical reliable event with its own schema and dedup window', () => {
+  const packet = canonicalConversationReadPacket()
+  const conversation = {
+    conversationId: 'conversation-1',
+    conversationType: 'single' as const,
+    peerOrganization: 902,
+    peerUserId: 'user_b'
+  }
+  const options = {
+    conversation,
+    currentAccessSnapshotId: '42'
+  }
+  assert.equal(
+    isCanonicalRealtimeEventPacketValid(packet, '901', 'user_a', options),
+    true
+  )
+
+  const missingEventId = structuredClone(packet)
+  delete (missingEventId.data as Partial<typeof packet.data>).event_id
+  assert.equal(
+    isCanonicalRealtimeEventPacketValid(missingEventId, '901', 'user_a', options),
+    false
+  )
+
+  const uppercaseEventId = structuredClone(packet)
+  uppercaseEventId.data.event_id = 'A'.repeat(64)
+  assert.equal(
+    isCanonicalRealtimeEventPacketValid(uppercaseEventId, '901', 'user_a', options),
+    false
+  )
+
+  const wrongEventType = structuredClone(packet)
+  wrongEventType.data.event_type = 'message.receipt'
+  assert.equal(
+    isCanonicalRealtimeEventPacketValid(wrongEventType, '901', 'user_a', options),
+    false
+  )
+
+  const invalidReadFields: Array<[string, (candidate: any) => void]> = [
+    ['missing conversation_id', candidate => delete candidate.data.conversation_id],
+    ['empty conversation_id', candidate => { candidate.data.conversation_id = ' ' }],
+    ['missing last_read_message_id', candidate => delete candidate.data.last_read_message_id],
+    ['empty last_read_message_id', candidate => { candidate.data.last_read_message_id = '' }],
+    ['zero last_read_seq', candidate => { candidate.data.last_read_seq = 0 }],
+    ['string last_read_seq', candidate => { candidate.data.last_read_seq = '9' }],
+    ['unsafe last_read_seq', candidate => { candidate.data.last_read_seq = Number.MAX_SAFE_INTEGER + 1 }],
+    ['negative unread_count', candidate => { candidate.data.unread_count = -1 }],
+    ['string unread_count', candidate => { candidate.data.unread_count = '0' }],
+    ['unsafe unread_count', candidate => { candidate.data.unread_count = Number.MAX_SAFE_INTEGER + 1 }],
+    ['string organization', candidate => { candidate.organization = '901' }],
+    ['zero user_organization', candidate => { candidate.data.user_organization = 0 }],
+    ['unsafe user_organization', candidate => {
+      candidate.data.user_organization = Number.MAX_SAFE_INTEGER + 1
+    }],
+    ['empty user_id', candidate => { candidate.data.user_id = ' ' }],
+    ['missing time', candidate => delete candidate.data.time],
+    ['empty time', candidate => { candidate.data.time = '' }]
+  ]
+  for (const [label, mutate] of invalidReadFields) {
+    const candidate = structuredClone(packet)
+    mutate(candidate)
+    assert.equal(
+      isCanonicalRealtimeEventPacketValid(candidate, '901', 'user_a', options),
+      false,
+      label
+    )
+  }
+
+  const window = new RealtimeEventDedupWindow('901', 'user_a', new MemoryStorage())
+  assert.equal(window.observe(packet.data.event_id), 'new')
+  assert.equal(window.observe(packet.data.event_id), 'duplicate')
+})
+
+test('conversation read binds cross-organization snapshot to both home projections', () => {
+  const readerHome = canonicalConversationReadPacket()
+  readerHome.data.user_organization = 901
+  assert.equal(isCanonicalRealtimeEventPacketValid(
+    readerHome,
+    '901',
+    'reader',
+    {
+      conversation: {
+        conversationId: 'conversation-1',
+        conversationType: 'single',
+        peerOrganization: 902,
+        peerUserId: 'peer'
+      },
+      currentAccessSnapshotId: '42'
+    }
+  ), true)
+
+  const peerHome = canonicalConversationReadPacket()
+  peerHome.organization = 902
+  peerHome.data.user_organization = 901
+  assert.equal(isCanonicalRealtimeEventPacketValid(
+    peerHome,
+    '902',
+    'peer',
+    {
+      conversation: {
+        conversationId: 'conversation-1',
+        conversationType: 'single',
+        peerOrganization: 901,
+        peerUserId: 'reader'
+      },
+      currentAccessSnapshotId: '42'
+    }
+  ), true)
+})
+
+test('conversation read rejects missing, malformed or mismatched cross-organization snapshots', () => {
+  const packet = canonicalConversationReadPacket()
+  const conversation = {
+    conversationId: 'conversation-1',
+    conversationType: 'single' as const,
+    peerOrganization: 902,
+    peerUserId: 'user_b'
+  }
+  const validOptions = {
+    conversation,
+    currentAccessSnapshotId: '42'
+  }
+
+  assert.equal(isCanonicalRealtimeEventPacketValid(
+    packet, '901', 'user_a', { ...validOptions, conversation: null }
+  ), false)
+  assert.equal(isCanonicalRealtimeEventPacketValid(
+    packet,
+    '901',
+    'user_a',
+    {
+      ...validOptions,
+      conversation: { ...conversation, conversationId: 'conversation-other' }
+    }
+  ), false)
+
+  for (const snapshotId of [undefined, '0', '01', 'snapshot-42', '1'.repeat(21), '43']) {
+    const candidate = structuredClone(packet)
+    if (snapshotId === undefined) {
+      delete (
+        candidate.data as Partial<typeof candidate.data>
+      ).cross_org_access_snapshot_id
+    } else {
+      candidate.data.cross_org_access_snapshot_id = snapshotId
+    }
+    assert.equal(
+      isCanonicalRealtimeEventPacketValid(candidate, '901', 'user_a', validOptions),
+      false,
+      'payload snapshot: ' + String(snapshotId)
+    )
+  }
+
+  for (const currentAccessSnapshotId of [undefined, '0', '01', '42x', '1'.repeat(21), '43']) {
+    assert.equal(
+      isCanonicalRealtimeEventPacketValid(packet, '901', 'user_a', {
+        conversation,
+        currentAccessSnapshotId
+      }),
+      false,
+      'current snapshot: ' + String(currentAccessSnapshotId)
+    )
+  }
+})
+
+test('same-organization single and group reads reject access snapshot fields', () => {
+  for (const conversationType of ['single', 'group'] as const) {
+    const withoutSnapshot = canonicalConversationReadPacket()
+    withoutSnapshot.data.user_organization = 901
+    delete (
+      withoutSnapshot.data as Partial<typeof withoutSnapshot.data>
+    ).cross_org_access_snapshot_id
+    const options = {
+      conversation: {
+        conversationId: 'conversation-1',
+        conversationType,
+        peerOrganization: 901,
+        peerUserId: 'user_b'
+      },
+      currentAccessSnapshotId: '42'
+    }
+    assert.equal(
+      isCanonicalRealtimeEventPacketValid(
+        withoutSnapshot,
+        '901',
+        'user_a',
+        options
+      ),
+      true,
+      conversationType + ':missing'
+    )
+    const withSnapshot = canonicalConversationReadPacket()
+    withSnapshot.data.user_organization = 901
+    assert.equal(
+      isCanonicalRealtimeEventPacketValid(
+        withSnapshot,
+        '901',
+        'user_a',
+        options
+      ),
+      false,
+      conversationType + ':present'
+    )
+  }
+})
+
 test('ACK and SYNC commands are outside the canonical event-id gate', () => {
   assert.equal(isCanonicalRealtimeCommand('send_ack'), false)
   assert.equal(isCanonicalRealtimeCommand('sync'), false)
+  assert.equal(isCanonicalRealtimeCommand('sync_ack'), false)
   assert.equal(isCanonicalRealtimeCommand('recall_ack'), false)
+  assert.equal(isCanonicalRealtimeCommand('conversation_read_ack'), false)
   assert.equal(isCanonicalRealtimeCommand('push'), true)
+  assert.equal(isCanonicalRealtimeCommand('conversation_read'), true)
 })
 
 test('control ACK responses bind client id, request metadata and current identity', () => {
