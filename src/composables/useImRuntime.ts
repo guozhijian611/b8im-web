@@ -2,16 +2,57 @@ import { computed, nextTick, onScopeDispose, ref, watch } from 'vue'
 import { layer } from '../services/layer'
 import { playNotificationSound } from '../services/notification'
 import {
+  classifyConversationReadEventDirection,
+  classifyMutationChangeSequence,
+  classifyReceiptEventDirection,
+  isControlAckResponseValid,
   isCanonicalRealtimeCommand,
   isCanonicalRealtimeEventPacketValid,
+  isConversationParticipantIdentity,
+  isDurableMutationValidForContext,
   isFriendRequestRealtimeEventPacketValid,
-  RealtimeEventDedupWindow
+  isMessageValidForConversation,
+  isPendingImRequestExpired,
+  RealtimeEventDedupWindow,
+  reusablePendingScreenshotClientMsgId
 } from '../services/realtimeEventDedup'
+import type { PendingImControlRequest } from '../services/realtimeEventDedup'
+import {
+  advanceConversationAccessEpoch,
+  assertConversationAccessEpochCurrent,
+  captureConversationAccessEpoch,
+  classifyAuthAccessSnapshot,
+  CONVERSATION_ACCESS_BROWSER_EVENT,
+  CONVERSATION_ACCESS_CHANGED_COMMAND,
+  ConversationAccessEpochChangedError,
+  currentConversationAccessSnapshot,
+  CrossOrgAccessSnapshotStore,
+  isAccessSnapshotFailClosed,
+  isConversationAccessEpochCurrent,
+  isConversationAccessRecoveryRequired,
+  normalizeAccessSnapshotId,
+  observeConversationAccessSnapshot,
+  parseConversationAccessChanged,
+  reconcileRevokedConversationIds,
+  setConversationAccessRecoveryRequired,
+  shouldProcessAccessSnapshotEvent
+} from '../services/conversationAccess'
+import type { ConversationAccessEpochToken } from '../services/conversationAccess'
 import type { TenantBrandConfig } from '../services/tenantConfig'
 import { activeServiceCandidate, promoteServiceCandidate } from '../services/routing'
 import { notifyTitleIncomingMessage } from '../services/titleNotifier'
 import { formatImMessageTime, formatImTime, parseImTimestamp } from '../services/time'
 import { attachTraceContext, PendingSendTraceRegistry } from '../services/imTelemetry'
+import { isSameImIdentity, normalizeImOrganization } from '../services/imIdentity'
+import {
+  canRecoverGlobalSyncConversation,
+  commitGlobalSyncRecoveryCursor,
+  GlobalSyncCursorStore,
+  isExpectedStaleGlobalSyncSnapshot,
+  type GlobalSyncPage,
+  validateGlobalSyncPage
+} from '../services/imGlobalSync'
+import { resolveCapturedUploadConversation } from '../services/imUploadTarget'
 import {
   parseTraceContext,
   tryStartTelemetrySpan,
@@ -84,6 +125,65 @@ type AuthenticatedConnectionState = {
   sessionId: string
 }
 
+type ConversationSyncChange = {
+  conversation_id: string
+  change_seq: number
+  change_type: 'recall' | 'edit' | 'delete_both' | 'delete_self'
+  message_id: string
+  message_seq: number
+  target_organization: string | null
+  target_user_id: string | null
+  payload: Record<string, unknown>
+  create_time?: string
+}
+
+type ConversationSyncPage = {
+  scope: 'conversation'
+  conversation_id: string
+  messages: ImPacketMessage[]
+  changes: ConversationSyncChange[]
+  next_after_seq: number
+  next_after_change_seq: number
+  messages_has_more: boolean
+  changes_has_more: boolean
+  cross_org_access_snapshot_id: string
+  access_snapshot_behind_high_water: boolean
+}
+
+type PendingConversationSyncRequest = {
+  clientMsgId: string
+  conversationId: string
+  afterSeq: number
+  afterChangeSeq: number
+  epoch: ConversationAccessEpochToken
+  snapshotId: string
+  resolve: (page: ConversationSyncPage) => void
+  reject: (error: Error) => void
+  timer: number
+}
+
+type PendingGlobalSyncRequest = {
+  clientMsgId: string
+  afterGlobalSeq: string
+  resolve: (page: GlobalSyncPage) => void
+  reject: (error: Error) => void
+  timer: number
+}
+
+type PendingAuthoritativeControlAck = {
+  resolve: () => void
+  reject: (error: Error) => void
+}
+
+type StableGlobalSyncBatch = {
+  previousCursor: string
+  nextCursor: string
+  accessSnapshotId: string
+  accessSnapshotBehindHighWater: boolean
+  epoch: ConversationAccessEpochToken
+  messages: ImPacketMessage[]
+}
+
 type ForwardMode = 'separate' | 'merged'
 type SerializedForwardItem = {
   sender: string
@@ -108,6 +208,21 @@ const MESSAGE_TYPE_VOICE = 4
 const MESSAGE_TYPE_SYSTEM = 5
 const MESSAGE_TYPE_VIDEO = 11
 const SEND_TRACE_TIMEOUT_MS = 30000
+const CONTROL_REQUEST_TIMEOUT_MS = 30000
+const CONVERSATION_SYNC_PAGE_LIMIT = 50
+const GLOBAL_SYNC_PAGE_LIMIT = 100
+const GLOBAL_SYNC_MAX_PAGES = 100
+const GLOBAL_SYNC_MAX_RESTARTS = 5
+const AUTH_RECOVERY_BUFFER_LIMIT = 2048
+const DELIVERY_STATE_RANK: Record<'sent' | 'delivered' | 'read', number> = {
+  sent: 1,
+  delivered: 2,
+  read: 3
+}
+
+function isRecord(value: unknown): value is Record<string, any> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
+}
 
 function firstText(value: string) {
   return (value.trim().slice(0, 1) || '用').toUpperCase()
@@ -115,18 +230,36 @@ function firstText(value: string) {
 
 function senderDisplayName(sender?: ImMessageSender | null) {
   if (!sender) return ''
-  return String(sender.nickname || sender.account || sender.user_id || '')
+  const serverDisplayName = String(sender.display_name ?? '').trim()
+  if (serverDisplayName) return serverDisplayName
+  const base = String(sender.nickname || sender.account || sender.user_id || '')
+  const isCrossOrganization =
+    sender.is_cross_organization === true ||
+    Number(sender.is_cross_organization ?? 0) === 1
+  const companyName = String(sender.company_name ?? sender.organization_name ?? '').trim()
+  return isCrossOrganization && companyName ? `${base} · ${companyName}` : base
 }
 
 function senderAvatarUrl(sender?: ImMessageSender | null) {
   return String(sender?.avatar_url ?? '')
 }
 
-function systemNoticeText(content: Record<string, unknown>, currentUserId: string, conversationType: ImConversation['conversationType']) {
+function systemNoticeText(
+  content: Record<string, unknown>,
+  currentOrganization: string,
+  currentUserId: string,
+  conversationType: ImConversation['conversationType']
+) {
   const event = String(content?.event ?? '')
+  const actorOrganization = normalizeImOrganization(content?.actor_organization)
   const actorUserId = String(content?.actor_user_id ?? '')
   const actorName = String(content?.actor_name ?? '').trim() || '有人'
-  const isSelf = actorUserId !== '' && actorUserId === currentUserId
+  const isSelf = isSameImIdentity(
+    actorOrganization,
+    actorUserId,
+    currentOrganization,
+    currentUserId
+  )
   const actor = isSelf ? '你' : (conversationType === 'group' ? actorName : '对方')
 
   if (event === 'recall') return `${actor}撤回了一条消息`
@@ -136,6 +269,7 @@ function systemNoticeText(content: Record<string, unknown>, currentUserId: strin
 
 function messageText(
   message: ImPacketMessage,
+  currentOrganization = '',
   currentUserId = '',
   conversationType: ImConversation['conversationType'] = 'single'
 ) {
@@ -150,7 +284,9 @@ function messageText(
   if (message.message_type === MESSAGE_TYPE_VOICE) return '[语音]'
   if (message.message_type === MESSAGE_TYPE_VIDEO) return '[视频]'
   if (message.message_type === MESSAGE_TYPE_SYSTEM) {
-    return systemNoticeText(message.content ?? {}, currentUserId, conversationType)
+    return systemNoticeText(
+      message.content ?? {}, currentOrganization, currentUserId, conversationType
+    )
   }
   return '[消息]'
 }
@@ -287,7 +423,22 @@ function createClientMsgId() {
 
 function mapPacketMessage(message: ImPacketMessage, currentSession: WebImSession, conversation: ImConversation): Message {
   const currentUserId = currentSession.user.userId
-  const isOut = message.sender_id === currentUserId
+  const senderId = String(message.sender_id ?? '').trim()
+  const senderOrganization = normalizeImOrganization(message.sender_organization)
+  if (!isMessageValidForConversation(
+    message as unknown as Record<string, unknown>,
+    currentSession.organization,
+    currentUserId,
+    conversation
+  )) {
+    throw new Error('消息会话归属或参与者复合身份无效')
+  }
+  const isOut = isSameImIdentity(
+    senderOrganization,
+    message.sender_id,
+    currentSession.organization,
+    currentUserId
+  )
   const isSystem = Number(message.message_type ?? 0) === MESSAGE_TYPE_SYSTEM
   const peerUser = conversation.peerUser ?? null
   const senderUser = message.sender_user ?? null
@@ -297,15 +448,20 @@ function mapPacketMessage(message: ImPacketMessage, currentSession: WebImSession
     ? '我'
     : displayName !== ''
       ? displayName
-      : peerUser?.userId === message.sender_id
-      ? peerUser.nickname
+      : isSameImIdentity(
+          peerUser?.organization,
+          peerUser?.userId,
+          senderOrganization,
+          message.sender_id
+        )
+      ? peerUser?.nickname || message.sender_id
       : message.sender_id
   const avatarText = isOut
     ? firstText(currentSession.user.nickname || currentSession.user.account || '我')
     : firstText(displayName || peerUser?.nickname || peerUser?.account || message.sender_id)
 
   return {
-    id: message.client_msg_id || message.message_id || String(message.id),
+    id: message.message_id || String(message.id),
     messageId: message.message_id,
     conversationId: message.conversation_id,
     fileId: String(message.content?.file_id ?? ''),
@@ -314,7 +470,9 @@ function mapPacketMessage(message: ImPacketMessage, currentSession: WebImSession
     avatarUrl: isOut ? currentSession.user.avatarUrl : senderAvatarUrl(senderUser) || peerUser?.avatarUrl,
     side: isSystem ? 'system' : (isOut ? 'out' : 'in'),
     type: messageTypeName(Number(message.message_type ?? 1)),
-    content: forwardBundle?.title ?? messageText(message, currentUserId, conversation.conversationType),
+    content: forwardBundle?.title ?? messageText(
+      message, currentSession.organization, currentUserId, conversation.conversationType
+    ),
     url: [MESSAGE_TYPE_IMAGE, MESSAGE_TYPE_FILE, MESSAGE_TYPE_VOICE, MESSAGE_TYPE_VIDEO].includes(Number(message.message_type ?? 0))
       ? ''
       : String(message.content?.url ?? ''),
@@ -323,10 +481,11 @@ function mapPacketMessage(message: ImPacketMessage, currentSession: WebImSession
     messageSeq: Number(message.message_seq ?? 0),
     createTime: message.create_time,
     time: formatImMessageTime(message.create_time),
-    state: isOut ? 'delivered' : undefined,
+    state: isOut ? (message.delivery_status ?? 'sent') : undefined,
     editTime: String(message.edit_time ?? ''),
     editCount: Number(message.edit_count ?? 0),
     senderUserId: message.sender_id,
+    senderOrganization,
     quote: normalizeMessageQuote(message.content?.reply),
     mentions: normalizeMentions(message.content?.mentions),
     forwardBundle,
@@ -378,9 +537,28 @@ export function useImRuntime(
   const conversations = ref<ImConversation[]>([])
   const activeConversationId = ref('')
   const messages = ref<Record<string, Message[]>>({})
+  const typingByConversation = ref<Record<string, string>>({})
   const messageCursors = new Map<string, number>()
   const messageBeforeCursors = new Map<string, number>()
   const messageHasMoreBefore = new Map<string, boolean>()
+  const pendingControlRequests = new Map<string, PendingImControlRequest>()
+  const pendingControlTimers = new Map<string, number>()
+  const completedControlRequests = new Map<string, PendingImControlRequest>()
+  const completedControlTimers = new Map<string, number>()
+  const pendingAuthoritativeControlAcks =
+    new Map<string, PendingAuthoritativeControlAck>()
+  const pendingConversationSyncRequests =
+    new Map<string, PendingConversationSyncRequest>()
+  const pendingGlobalSyncRequests = new Map<string, PendingGlobalSyncRequest>()
+  const pendingScreenshotRequests = new Map<string, string>()
+  const conversationChangeCursors = new Map<string, number>()
+  const messageChangeCursors = new Map<string, number>()
+  const conversationReadCursors = new Map<string, number>()
+  const changeRefreshInFlight = new Map<string, Promise<void>>()
+  const revokedConversationIds = new Set<string>()
+  const restorableConversationIds = new Set<string>()
+  const typingTimers = new Map<string, number>()
+  const lastTypingSentAt = new Map<string, number>()
   const loadingOlderMessages = ref(false)
   const messageDeleteConfig = ref({
     deleteSingleEnabled: false,
@@ -397,6 +575,21 @@ export function useImRuntime(
   let localMessageOrder = 0
   let localConversationSortOrder = 0
   let recentRealtimeEvents: RealtimeEventDedupWindow | null = null
+  let crossOrgAccessSnapshotStore: CrossOrgAccessSnapshotStore | null = null
+  let crossOrgAccessSnapshotScope = ''
+  let globalSyncCursorStore: GlobalSyncCursorStore | null = null
+  let globalSyncCursorScope = ''
+  let crossOrgAccessRecoveryRequired = false
+  let authenticatedRecoverySequence = 0
+  let authenticatedRecoveryPackets: ImPacket[] = []
+  let authenticatedAccessSnapshotBehindHighWater = false
+  let authenticatedStaleAccessSnapshotId = ''
+  let accessSnapshotRebuild: {
+    snapshotId: string
+    epoch: ConversationAccessEpochToken
+    full: boolean
+    promise: Promise<void>
+  } | null = null
   const pendingSendTraces = new PendingSendTraceRegistry(
     SEND_TRACE_TIMEOUT_MS,
     (clientMsgId) => markLocalMessageFailed(clientMsgId)
@@ -411,6 +604,88 @@ export function useImRuntime(
     return recentRealtimeEvents
   }
 
+  function accessSnapshotStore() {
+    const organization = String(session().organization ?? '').trim()
+    const userId = String(session().user.userId ?? '').trim()
+    const scope = `${organization}\u0000${userId}`
+    if (!crossOrgAccessSnapshotStore || crossOrgAccessSnapshotScope !== scope) {
+      crossOrgAccessSnapshotStore = new CrossOrgAccessSnapshotStore(organization, userId)
+      crossOrgAccessSnapshotScope = scope
+      if (crossOrgAccessSnapshotStore.highWater) {
+        observeConversationAccessSnapshot(
+          organization,
+          userId,
+          crossOrgAccessSnapshotStore.highWater
+        )
+      }
+      if (crossOrgAccessSnapshotStore.current === '0') {
+        observeConversationAccessSnapshot(organization, userId, '0')
+      }
+    }
+    return crossOrgAccessSnapshotStore
+  }
+
+  function currentAccessSnapshotId() {
+    return currentConversationAccessSnapshot(
+      session().organization,
+      session().user.userId
+    )
+  }
+
+  function syncCursorStore() {
+    const organization = String(session().organization ?? '').trim()
+    const userId = String(session().user.userId ?? '').trim()
+    const scope = `${organization}\u0000${userId}`
+    if (!globalSyncCursorStore || globalSyncCursorScope !== scope) {
+      globalSyncCursorStore = new GlobalSyncCursorStore()
+      globalSyncCursorScope = scope
+    }
+    return globalSyncCursorStore
+  }
+
+  function captureAccessEpoch() {
+    return captureConversationAccessEpoch(
+      session().organization,
+      session().user.userId
+    )
+  }
+
+  function observeAccessSnapshot(snapshotId: unknown) {
+    const normalized = normalizeAccessSnapshotId(snapshotId)
+    if (!normalized) return 'invalid' as const
+    const stored = accessSnapshotStore().observe(normalized)
+    if (stored === 'invalid' || stored === 'stale') return stored
+    return observeConversationAccessSnapshot(
+      session().organization,
+      session().user.userId,
+      normalized
+    )
+  }
+
+  function isCrossOrgSingle(conversation: ImConversation) {
+    return conversation.conversationType === 'single' &&
+      normalizeImOrganization(conversation.peerOrganization) !==
+        session().organization
+  }
+
+  function isCrossOrgAccessFailClosed() {
+    return crossOrgAccessRecoveryRequired ||
+      isConversationAccessRecoveryRequired(
+        session().organization,
+        session().user.userId
+      ) ||
+      isAccessSnapshotFailClosed(currentAccessSnapshotId())
+  }
+
+  function setCrossOrgAccessRecoveryRequired(required: boolean) {
+    crossOrgAccessRecoveryRequired = required
+    setConversationAccessRecoveryRequired(
+      session().organization,
+      session().user.userId,
+      required
+    )
+  }
+
   const activeConversation = computed(() => {
     return conversations.value.find((item) => item.id === activeConversationId.value) ?? null
   })
@@ -418,6 +693,10 @@ export function useImRuntime(
   const activeMessages = computed(() => {
     const active = activeConversation.value
     return active ? messages.value[active.id] ?? [] : []
+  })
+  const activeTypingText = computed(() => {
+    const active = activeConversation.value
+    return active ? typingByConversation.value[active.conversationId] ?? '' : ''
   })
 
   const totalUnread = computed(() => {
@@ -470,7 +749,126 @@ export function useImRuntime(
     pendingSendTraces.failAll(code, type)
   }
 
+  function resolvePendingControlRequest(clientMsgId: string) {
+    const expected = pendingControlRequests.get(clientMsgId)
+    window.clearTimeout(pendingControlTimers.get(clientMsgId) ?? 0)
+    pendingControlTimers.delete(clientMsgId)
+    pendingControlRequests.delete(clientMsgId)
+    if (
+      expected?.command === 'screenshot' &&
+      pendingScreenshotRequests.get(expected.conversationId) === clientMsgId
+    ) {
+      pendingScreenshotRequests.delete(expected.conversationId)
+    }
+    return expected
+  }
+
+  function rejectAuthoritativeControlAck(
+    clientMsgId: string,
+    error: Error
+  ) {
+    const waiter = pendingAuthoritativeControlAcks.get(clientMsgId)
+    if (!waiter) return
+    pendingAuthoritativeControlAcks.delete(clientMsgId)
+    waiter.reject(error)
+  }
+
+  function waitForAuthoritativeControlAck(clientMsgId: string) {
+    return new Promise<void>((resolve, reject) => {
+      pendingAuthoritativeControlAcks.set(clientMsgId, {
+        resolve,
+        reject
+      })
+    })
+  }
+
+  function registerPendingControlRequest(
+    request: Omit<PendingImControlRequest, 'createdAt'>
+  ) {
+    resolvePendingControlRequest(request.clientMsgId)
+    window.clearTimeout(completedControlTimers.get(request.clientMsgId) ?? 0)
+    completedControlTimers.delete(request.clientMsgId)
+    completedControlRequests.delete(request.clientMsgId)
+    const pending: PendingImControlRequest = {
+      ...request,
+      createdAt: Date.now()
+    }
+    pendingControlRequests.set(request.clientMsgId, pending)
+    pendingControlTimers.set(request.clientMsgId, window.setTimeout(() => {
+      const current = pendingControlRequests.get(request.clientMsgId)
+      if (
+        !current ||
+        !isPendingImRequestExpired(current, Date.now(), CONTROL_REQUEST_TIMEOUT_MS)
+      ) {
+        return
+      }
+      resolvePendingControlRequest(request.clientMsgId)
+      rejectAuthoritativeControlAck(
+        request.clientMsgId,
+        new Error('IM 控制回执权威确认超时')
+      )
+      if (current.command === 'send') {
+        finishSendTrace(request.clientMsgId, 'IM_SEND_ACK_TIMEOUT')
+        markLocalMessageFailed(request.clientMsgId)
+      }
+    }, CONTROL_REQUEST_TIMEOUT_MS))
+    return pending
+  }
+
+  function completePendingControlRequest(clientMsgId: string) {
+    const expected = resolvePendingControlRequest(clientMsgId)
+    if (!expected) return null
+    const authoritativeAck = pendingAuthoritativeControlAcks.get(clientMsgId)
+    if (authoritativeAck) {
+      pendingAuthoritativeControlAcks.delete(clientMsgId)
+      authoritativeAck.resolve()
+    }
+    const completed = { ...expected, createdAt: Date.now() }
+    completedControlRequests.set(clientMsgId, completed)
+    completedControlTimers.set(clientMsgId, window.setTimeout(() => {
+      completedControlRequests.delete(clientMsgId)
+      completedControlTimers.delete(clientMsgId)
+    }, CONTROL_REQUEST_TIMEOUT_MS))
+    return completed
+  }
+
+  function clearPendingControlRequests() {
+    for (const [clientMsgId, waiter] of pendingAuthoritativeControlAcks) {
+      waiter.reject(new Error('IM 连接已关闭，权威控制回执已取消'))
+      pendingAuthoritativeControlAcks.delete(clientMsgId)
+    }
+    for (const timer of pendingControlTimers.values()) window.clearTimeout(timer)
+    pendingControlTimers.clear()
+    pendingControlRequests.clear()
+    pendingScreenshotRequests.clear()
+    for (const timer of completedControlTimers.values()) window.clearTimeout(timer)
+    completedControlTimers.clear()
+    completedControlRequests.clear()
+    for (const request of pendingConversationSyncRequests.values()) {
+      window.clearTimeout(request.timer)
+      request.reject(new Error('IM 连接已关闭，会话同步已取消'))
+    }
+    pendingConversationSyncRequests.clear()
+    for (const request of pendingGlobalSyncRequests.values()) {
+      window.clearTimeout(request.timer)
+      request.reject(new Error('IM 连接已关闭，全局同步已取消'))
+    }
+    pendingGlobalSyncRequests.clear()
+  }
+
   async function boot() {
+    const accessObservation = observeAccessSnapshot(
+      session().crossOrgAccessSnapshotId
+    )
+    if (accessObservation === 'invalid') {
+      throw new Error('登录会话的跨机构访问快照无效')
+    }
+    // Login is only a seed. No cross-organization write is allowed until the
+    // authenticated connection completes its authoritative rebuild.
+    setCrossOrgAccessRecoveryRequired(true)
+    if (isCrossOrgAccessFailClosed()) {
+      failCloseCrossOrgAccess(false)
+    }
     await loadMessageConfig()
     await loadMessageGroups()
     await loadConversations()
@@ -493,7 +891,11 @@ export function useImRuntime(
   }
 
   async function loadConversations() {
-    const loaded = await fetchConversations(config(), session())
+    const loaded = (await fetchConversations(config(), session())).filter(
+      (conversation) =>
+        !revokedConversationIds.has(conversation.conversationId) &&
+        !(isCrossOrgAccessFailClosed() && isCrossOrgSingle(conversation))
+    )
     const activeVirtual = activeConversation.value?.virtual ? activeConversation.value : null
     conversations.value =
       activeVirtual && !loaded.some((item) => item.id === activeVirtual.id)
@@ -518,7 +920,21 @@ export function useImRuntime(
   }
 
   async function startSingleChat(contact: Contact) {
-    const existing = conversations.value.find((item) => item.peerUserId === contact.userId)
+    if (
+      isCrossOrgAccessFailClosed() &&
+      normalizeImOrganization(contact.organization) !== session().organization
+    ) {
+      layer.warning('跨机构访问尚未初始化，暂不能发起跨机构单聊')
+      return
+    }
+    const existing = conversations.value.find((item) =>
+      isSameImIdentity(
+        item.peerOrganization,
+        item.peerUserId,
+        contact.organization,
+        contact.userId
+      )
+    )
     const conversation = existing ?? createVirtualConversation(contact)
     if (!existing) {
       conversations.value = [conversation, ...conversations.value]
@@ -533,6 +949,19 @@ export function useImRuntime(
   async function createGroup(title: string, contacts: Contact[]) {
     if (contacts.length < 2) {
       layer.warning('群聊至少选择 2 个好友')
+      return null
+    }
+    if (
+      contacts.some((contact) =>
+        !isSameImIdentity(
+          contact.organization,
+          contact.userId,
+          session().organization,
+          contact.userId
+        )
+      )
+    ) {
+      layer.warning('群聊不支持跨机构成员')
       return null
     }
     const group = await createGroupConversation(config(), session(), {
@@ -564,7 +993,9 @@ export function useImRuntime(
     }
     const result = await updateConversationGroupApi(config(), session(), {
       conversationId: conversation.conversationId,
-      messageGroupId
+      messageGroupId,
+      conversationType: conversation.conversationType,
+      peerOrganization: conversation.peerOrganization
     })
     conversations.value = conversations.value.map((item) =>
       item.id === conversationId
@@ -594,6 +1025,7 @@ export function useImRuntime(
     const cursor = messageCursors.get(conversation.id) ?? maxLocalMessageSeq(currentMessages)
     const result = await fetchMessages(config(), session(), {
       conversationId: conversation.conversationId,
+      peerOrganization: conversation.peerOrganization,
       peerUserId: conversation.peerUserId,
       afterSeq: cursor,
       limit: 50
@@ -612,13 +1044,50 @@ export function useImRuntime(
   async function loadRecentConversation(conversation: ImConversation) {
     const result = await fetchMessages(config(), session(), {
       conversationId: conversation.conversationId,
+      peerOrganization: conversation.peerOrganization,
       peerUserId: conversation.peerUserId,
       beforeSeq: 0,
       limit: 50
     })
     if (result.messages.length > 0) {
-      mergeMessages(conversation, result.messages)
-      updateConversationMessageBounds(conversation.id, result.messages, result)
+      let targetConversation = conversation
+      if (conversation.virtual) {
+        const conversationId = String(
+          result.messages[0]?.conversation_id ?? ''
+        ).trim()
+        if (!conversationId) {
+          throw new Error('虚拟单聊历史缺少权威 conversation_id')
+        }
+        const materialized: ImConversation = {
+          ...conversation,
+          id: conversationId,
+          conversationId,
+          virtual: false
+        }
+        // Validate the whole page against the virtual peer before mutating
+        // the local conversation identity.
+        result.messages.forEach((message) =>
+          mapPacketMessage(message, session(), materialized)
+        )
+        conversations.value = conversations.value.map((item) =>
+          item.id === conversation.id ? materialized : item
+        )
+        messages.value = {
+          ...messages.value,
+          [conversationId]: messages.value[conversation.id] ?? []
+        }
+        delete messages.value[conversation.id]
+        if (activeConversationId.value === conversation.id) {
+          activeConversationId.value = conversationId
+        }
+        targetConversation = materialized
+      }
+      mergeMessages(targetConversation, result.messages)
+      updateConversationMessageBounds(
+        targetConversation.id,
+        result.messages,
+        result
+      )
       await nextTick()
       scrollMessagesToBottom()
       return
@@ -642,10 +1111,12 @@ export function useImRuntime(
     try {
       const result = await fetchMessages(config(), session(), {
         conversationId: conversation.conversationId,
+        peerOrganization: conversation.peerOrganization,
         peerUserId: conversation.peerUserId,
         beforeSeq,
         limit: 50
       })
+      if (revokedConversationIds.has(conversation.conversationId)) return false
       if (result.messages.length === 0) {
         messageHasMoreBefore.set(conversation.id, false)
         return false
@@ -688,6 +1159,7 @@ export function useImRuntime(
       window.clearInterval(pingTimer)
       pingTimer = 0
       failPendingSendTraces('IM_WEBSOCKET_CLOSED', 'connection_closed')
+      failCloseCrossOrgAccess(false)
       clearSocketAuthState(current)
       socket = null
       connectionState.value = 'offline'
@@ -819,6 +1291,11 @@ export function useImRuntime(
   async function sendAsset(file: File, kind: UploadedAsset['kind']) {
     const conversation = activeConversation.value
     if (!conversation) return false
+    const accessEpoch = captureAccessEpoch()
+    if (isCrossOrgAccessFailClosed() && isCrossOrgSingle(conversation)) {
+      layer.warning('当前跨机构访问已关闭')
+      return false
+    }
     if (!socket || socket.readyState !== WebSocket.OPEN || connectionState.value !== 'connected') {
       layer.warning('IM连接未就绪，稍后再试')
       return false
@@ -852,16 +1329,21 @@ export function useImRuntime(
     try {
       uploaded = await uploadImAsset(config(), session(), file, kind, {
         conversationType: conversation.conversationType,
-        onProgress: (progress) => updateLocalMessage(conversation.id, clientMsgId, {
-          uploadProgress: Math.max(1, Math.min(99, progress)),
-          state: 'uploading'
-        })
+        onProgress: (progress) => {
+          if (!isConversationAccessEpochCurrent(accessEpoch)) return
+          updateLocalMessage(conversation.id, clientMsgId, {
+            uploadProgress: Math.max(1, Math.min(99, progress)),
+            state: 'uploading'
+          })
+        }
       })
+      assertConversationAccessEpochCurrent(accessEpoch)
     } catch (error) {
       updateLocalMessage(conversation.id, clientMsgId, {
         state: 'failed',
         uploadProgress: undefined
       })
+      if (localUrl) URL.revokeObjectURL(localUrl)
       layer.error(error instanceof Error ? error.message : '文件上传失败')
       return false
     }
@@ -883,9 +1365,33 @@ export function useImRuntime(
       uploadProgress: 100
     })
     if (localUrl) URL.revokeObjectURL(localUrl)
-    const sent = await sendMessage(type, {
-      file_id: uploaded.fileId
-    }, preview, kind, { clientMsgId, appendLocal: false })
+    let sent = false
+    try {
+      assertConversationAccessEpochCurrent(accessEpoch)
+      const sendConversation = resolveCapturedUploadConversation(
+        conversation,
+        conversations.value
+      )
+      if (!sendConversation) {
+        throw new Error('上传期间原会话已失效，附件未发送')
+      }
+      if (
+        isCrossOrgAccessFailClosed() &&
+        isCrossOrgSingle(sendConversation)
+      ) {
+        throw new Error('当前跨机构访问已关闭')
+      }
+      sent = await sendMessageToConversation(
+        sendConversation,
+        type,
+        { file_id: uploaded.fileId },
+        preview,
+        kind,
+        { clientMsgId, appendLocal: false }
+      )
+    } catch (error) {
+      layer.error(error instanceof Error ? error.message : '附件发送失败')
+    }
     if (!sent) {
       updateLocalMessage(conversation.id, clientMsgId, {
         state: 'failed',
@@ -915,8 +1421,20 @@ export function useImRuntime(
     localType: Message['type'],
     options: { clientMsgId?: string; appendLocal?: boolean; reply?: MessageQuote | null; mentions?: MessageMention[]; localAsset?: UploadedAsset } = {}
   ) {
+    if (isCrossOrgAccessFailClosed() && isCrossOrgSingle(conversation)) {
+      layer.warning('当前跨机构访问已关闭')
+      return false
+    }
     if (!socket || socket.readyState !== WebSocket.OPEN || connectionState.value !== 'connected') {
       layer.warning('IM连接未就绪，稍后再试')
+      return false
+    }
+    if (
+      conversation.conversationType === 'single' &&
+      (!normalizeImOrganization(conversation.peerOrganization) ||
+        conversation.peerUserId.trim() === '')
+    ) {
+      layer.warning('单聊缺少目标复合身份')
       return false
     }
 
@@ -939,6 +1457,7 @@ export function useImRuntime(
         time: formatImTime(),
         state: 'sent',
         senderUserId: session().user.userId,
+        senderOrganization: session().organization,
         quote: options.reply ?? null,
         mentions: options.mentions ?? [],
         meta: options.localAsset
@@ -955,12 +1474,25 @@ export function useImRuntime(
     }
     updateConversationPreview(conversation.id, preview)
     const sendTrace = startWsSpan('send', null, clientMsgId)
+    registerPendingControlRequest({
+      command: 'send',
+      clientMsgId,
+      conversationId: conversation.conversationId,
+      conversationType: conversation.conversationType,
+      peerOrganization: conversation.peerOrganization,
+      peerUserId: conversation.peerUserId,
+      messageType,
+      content: structuredClone(content)
+    })
     const sent = sendPacket({
       cmd: 'send',
       client_msg_id: clientMsgId,
       data: {
         conversation_type: conversation.conversationType,
         conversation_id: conversation.conversationId || undefined,
+        to_organization: conversation.conversationType === 'single'
+          ? Number(conversation.peerOrganization)
+          : undefined,
         to_user_id: conversation.conversationType === 'single' ? conversation.peerUserId : undefined,
         message_type: messageType,
         content
@@ -972,6 +1504,7 @@ export function useImRuntime(
         type: 'connection_unavailable',
         clientMsgId
       })
+      resolvePendingControlRequest(clientMsgId)
       markLocalMessageFailed(clientMsgId)
       return false
     }
@@ -1000,6 +1533,7 @@ export function useImRuntime(
       if (!message.fileId || !message.messageId || !message.conversationId) {
         throw new Error('原附件消息缺少可信转发上下文')
       }
+      const accessEpoch = captureAccessEpoch()
       const kind = message.type as UploadedAsset['kind']
       const asset = await deriveForwardAssetApi(config(), session(), {
         conversationId: message.conversationId,
@@ -1007,6 +1541,7 @@ export function useImRuntime(
         fileId: message.fileId,
         kind
       })
+      assertConversationAccessEpochCurrent(accessEpoch)
       const messageType = kind === 'image'
         ? MESSAGE_TYPE_IMAGE
         : kind === 'voice'
@@ -1145,6 +1680,7 @@ export function useImRuntime(
     if (needsMessageProof && (!message.conversationId || !message.messageId)) {
       throw new Error('附件消息缺少可见性上下文')
     }
+    const accessEpoch = captureAccessEpoch()
     const url = await resolveImAssetUrl(
       config(),
       session(),
@@ -1156,6 +1692,7 @@ export function useImRuntime(
       },
       force
     )
+    assertConversationAccessEpochCurrent(accessEpoch)
     if (message.conversationId) {
       updateLocalMessage(message.conversationId, message.id, { url })
     }
@@ -1165,16 +1702,25 @@ export function useImRuntime(
 
   async function recallMessage(message: Message) {
     const conversation = activeConversation.value
-    if (!conversation || !message.messageId) return false
+    if (!conversation || !message.messageId || !message.conversationId) return false
     if (message.side !== 'out') {
       layer.warning('只能撤回自己发送的消息')
       return false
     }
-    sendPacket({
+    const clientMsgId = createClientMsgId()
+    registerPendingControlRequest({
+      command: 'recall',
+      clientMsgId,
+      conversationId: message.conversationId,
+      messageId: message.messageId
+    })
+    const sent = sendPacket({
       cmd: 'recall',
+      client_msg_id: clientMsgId,
       data: { message_id: message.messageId }
     })
-    return true
+    if (!sent) resolvePendingControlRequest(clientMsgId)
+    return sent
   }
 
   async function sendScreenshotNotice() {
@@ -1188,11 +1734,50 @@ export function useImRuntime(
       return false
     }
 
-    sendPacket({
+    const existingClientMsgId = pendingScreenshotRequests.get(conversation.conversationId)
+    const existing = existingClientMsgId
+      ? pendingControlRequests.get(existingClientMsgId)
+      : null
+    const reusableClientMsgId = reusablePendingScreenshotClientMsgId(
+      existing,
+      conversation.conversationId,
+      Date.now(),
+      CONTROL_REQUEST_TIMEOUT_MS
+    )
+    const clientMsgId = reusableClientMsgId || createClientMsgId()
+    if (!reusableClientMsgId) {
+      registerPendingControlRequest({
+        command: 'screenshot',
+        clientMsgId,
+        conversationId: conversation.conversationId
+      })
+      pendingScreenshotRequests.set(conversation.conversationId, clientMsgId)
+    }
+    const sent = sendPacket({
       cmd: 'screenshot',
+      client_msg_id: clientMsgId,
       data: { conversation_id: conversation.conversationId }
     })
-    return true
+    if (!sent) resolvePendingControlRequest(clientMsgId)
+    return sent
+  }
+
+  function sendTyping() {
+    const conversation = activeConversation.value
+    if (!conversation || conversation.virtual || !conversation.conversationId) return false
+    if (!socket || socket.readyState !== WebSocket.OPEN || connectionState.value !== 'connected') {
+      return false
+    }
+    const now = Date.now()
+    if (now - (lastTypingSentAt.get(conversation.conversationId) ?? 0) < 1500) {
+      return true
+    }
+    const sent = sendPacket({
+      cmd: 'typing',
+      data: { conversation_id: conversation.conversationId }
+    })
+    if (sent) lastTypingSentAt.set(conversation.conversationId, now)
+    return sent
   }
 
   async function editMessage(message: Message, text: string) {
@@ -1214,14 +1799,27 @@ export function useImRuntime(
       return false
     }
 
-    sendPacket({
+    const conversationId = String(message.conversationId ?? '').trim()
+    if (!conversationId) return false
+    const clientMsgId = createClientMsgId()
+    const content = { text: value }
+    registerPendingControlRequest({
+      command: 'edit',
+      clientMsgId,
+      conversationId,
+      messageId: message.messageId,
+      content
+    })
+    const sent = sendPacket({
       cmd: 'edit',
+      client_msg_id: clientMsgId,
       data: {
         message_id: message.messageId,
-        content: { text: value }
+        content
       }
     })
-    return true
+    if (!sent) resolvePendingControlRequest(clientMsgId)
+    return sent
   }
 
   async function deleteMessage(message: Message, scope: 'self' | 'both') {
@@ -1245,14 +1843,26 @@ export function useImRuntime(
       return false
     }
 
-    sendPacket({
+    const conversationId = String(message.conversationId ?? '').trim()
+    if (!conversationId) return false
+    const clientMsgId = createClientMsgId()
+    registerPendingControlRequest({
+      command: 'delete',
+      clientMsgId,
+      conversationId,
+      messageId: message.messageId,
+      scope
+    })
+    const sent = sendPacket({
       cmd: 'delete',
+      client_msg_id: clientMsgId,
       data: {
         message_id: message.messageId,
         scope
       }
     })
-    return true
+    if (!sent) resolvePendingControlRequest(clientMsgId)
+    return sent
   }
 
   async function deleteMessages(sourceMessages: Message[], scope: 'self' | 'both') {
@@ -1267,6 +1877,1392 @@ export function useImRuntime(
     return true
   }
 
+  function mutationCursorKey(conversationId: string, messageId = '') {
+    return `${session().organization}\u0000${conversationId}\u0000${messageId}`
+  }
+
+  function rejectGlobalSyncRequest(clientMsgId: string, error: Error) {
+    const request = pendingGlobalSyncRequests.get(clientMsgId)
+    if (!request) return
+    window.clearTimeout(request.timer)
+    pendingGlobalSyncRequests.delete(clientMsgId)
+    request.reject(error)
+  }
+
+  function requestGlobalSyncPage(current: WebSocket, afterGlobalSeq: string) {
+    return new Promise<GlobalSyncPage>((resolve, reject) => {
+      const clientMsgId = createClientMsgId()
+      const request: PendingGlobalSyncRequest = {
+        clientMsgId,
+        afterGlobalSeq,
+        resolve,
+        reject,
+        timer: 0
+      }
+      request.timer = window.setTimeout(() => {
+        rejectGlobalSyncRequest(
+          clientMsgId,
+          new Error('全局 SYNC 响应超时')
+        )
+      }, CONTROL_REQUEST_TIMEOUT_MS)
+      pendingGlobalSyncRequests.set(clientMsgId, request)
+      if (!sendPacketToSocket(current, {
+        cmd: 'sync',
+        client_msg_id: clientMsgId,
+        data: {
+          after_global_seq: afterGlobalSeq,
+          limit: GLOBAL_SYNC_PAGE_LIMIT
+        }
+      })) {
+        rejectGlobalSyncRequest(
+          clientMsgId,
+          new Error('IM 连接未就绪，无法执行全局同步')
+        )
+      }
+    })
+  }
+
+  async function collectStableGlobalSync(
+    current: WebSocket,
+    staleServerSnapshotId = ''
+  ): Promise<StableGlobalSyncBatch> {
+    const previousCursor = syncCursorStore().read()
+    for (let attempt = 0; attempt < GLOBAL_SYNC_MAX_RESTARTS; attempt += 1) {
+      const epoch = captureAccessEpoch()
+      let cursor = previousCursor
+      let batchSnapshotId = ''
+      let batchBehindHighWater = false
+      let restart = false
+      const messages = new Map<string, ImPacketMessage>()
+      for (let pageCount = 0; pageCount < GLOBAL_SYNC_MAX_PAGES; pageCount += 1) {
+        const page = await requestGlobalSyncPage(current, cursor)
+        const snapshotObservation = observeAccessSnapshot(page.accessSnapshotId)
+        const expectedStalePage = isExpectedStaleGlobalSyncSnapshot(
+          snapshotObservation,
+          page.accessSnapshotId,
+          staleServerSnapshotId
+        )
+        if (
+          snapshotObservation === 'invalid' ||
+          (snapshotObservation === 'stale' && !expectedStalePage)
+        ) {
+          throw new Error('全局 SYNC 返回了无效或回滚的访问快照')
+        }
+        if (snapshotObservation === 'new') {
+          failCloseCrossOrgAccess(false)
+          restart = true
+          break
+        }
+        if (!batchSnapshotId) {
+          batchSnapshotId = page.accessSnapshotId
+          batchBehindHighWater = expectedStalePage
+        }
+        if (
+          page.accessSnapshotId !== batchSnapshotId ||
+          expectedStalePage !== batchBehindHighWater ||
+          (
+            !batchBehindHighWater &&
+            page.accessSnapshotId !== epoch.snapshotId
+          ) ||
+          !isConversationAccessEpochCurrent(epoch)
+        ) {
+          restart = true
+          break
+        }
+        for (const message of page.messages) {
+          const existing = messages.get(message.message_id)
+          if (existing && existing.global_seq !== message.global_seq) {
+            throw new Error('全局 SYNC 同一 message_id 对应多个 global_seq')
+          }
+          messages.set(message.message_id, message)
+        }
+        cursor = page.nextAfterGlobalSeq
+        if (!page.hasMore) {
+          assertConversationAccessEpochCurrent(epoch)
+          return {
+            previousCursor,
+            nextCursor: cursor,
+            accessSnapshotId: batchSnapshotId,
+            accessSnapshotBehindHighWater: batchBehindHighWater,
+            epoch,
+            messages: [...messages.values()]
+          }
+        }
+      }
+      if (!restart) throw new Error('全局 SYNC 分页超过安全上限')
+    }
+    throw new Error('全局 SYNC 期间跨机构访问快照持续变化')
+  }
+
+  function applyGlobalSyncMessages(batch: StableGlobalSyncBatch) {
+    assertConversationAccessEpochCurrent(batch.epoch)
+    const applied: ImPacketMessage[] = []
+    for (const message of batch.messages) {
+      const conversation = conversations.value.find(
+        (item) => item.conversationId === message.conversation_id
+      )
+      if (!conversation) {
+        if (
+          batch.accessSnapshotBehindHighWater ||
+          revokedConversationIds.has(message.conversation_id)
+        ) {
+          continue
+        }
+        throw new Error('全局 SYNC 消息缺少权威会话，拒绝推进游标')
+      }
+      if (revokedConversationIds.has(message.conversation_id) ||
+        !canRecoverGlobalSyncConversation(
+          batch.accessSnapshotBehindHighWater ||
+            batch.accessSnapshotId === '0',
+          session().organization,
+          conversation
+        )) {
+        continue
+      }
+      if (!isMessageValidForConversation(
+        message as unknown as Record<string, unknown>,
+        session().organization,
+        session().user.userId,
+        conversation
+      )) {
+        throw new Error('全局 SYNC 消息复合身份或会话归属无效')
+      }
+      appendPacketMessage(
+        conversation,
+        message,
+        isSameImIdentity(
+          message.sender_organization,
+          message.sender_id,
+          session().organization,
+          session().user.userId
+        )
+          ? message.client_msg_id
+          : ''
+      )
+      messageCursors.set(
+        conversation.id,
+        Math.max(
+          messageCursors.get(conversation.id) ?? 0,
+          Number(message.message_seq ?? 0)
+        )
+      )
+      applied.push(message)
+    }
+    assertConversationAccessEpochCurrent(batch.epoch)
+    return applied
+  }
+
+  async function syncCachedConversationGaps(cachedConversationIds: Set<string>) {
+    for (const conversation of [...conversations.value]) {
+      if (!cachedConversationIds.has(conversation.conversationId) ||
+        revokedConversationIds.has(conversation.conversationId) ||
+        (isCrossOrgAccessFailClosed() && isCrossOrgSingle(conversation))) {
+        continue
+      }
+      const messageCursor = messageCursors.get(conversation.id) ??
+        maxLocalMessageSeq(messages.value[conversation.id] ?? [])
+      const changeCursor = conversationChangeCursors.get(
+        mutationCursorKey(conversation.conversationId)
+      ) ?? 0
+      if (
+        Number(conversation.lastMessageSeq ?? 0) <= messageCursor &&
+        Number(conversation.lastChangeSeq ?? 0) <= changeCursor
+      ) {
+        continue
+      }
+      await syncConversationFromCursors(conversation)
+      if (
+        (messageCursors.get(conversation.id) ?? 0) <
+          Number(conversation.lastMessageSeq ?? 0) ||
+        (conversationChangeCursors.get(
+          mutationCursorKey(conversation.conversationId)
+        ) ?? 0) < Number(conversation.lastChangeSeq ?? 0)
+      ) {
+        throw new Error('会话 SYNC 未追平 AUTH 会话摘要水位')
+      }
+    }
+  }
+
+  function rejectConversationSyncRequest(clientMsgId: string, error: Error) {
+    const request = pendingConversationSyncRequests.get(clientMsgId)
+    if (!request) return
+    window.clearTimeout(request.timer)
+    pendingConversationSyncRequests.delete(clientMsgId)
+    request.reject(error)
+  }
+
+  function requestConversationSyncPage(
+    conversation: ImConversation,
+    afterSeq: number,
+    afterChangeSeq: number
+  ) {
+    const epoch = captureAccessEpoch()
+    const snapshotId = epoch.snapshotId
+    if (!snapshotId) {
+      return Promise.reject(new Error('跨机构访问快照尚未建立'))
+    }
+    if (snapshotId === '0' && isCrossOrgSingle(conversation)) {
+      return Promise.reject(new Error('跨机构访问已关闭'))
+    }
+    const current = socket
+    if (
+      !current ||
+      current.readyState !== WebSocket.OPEN ||
+      authenticatedConnection?.socket !== current
+    ) {
+      return Promise.reject(new Error('IM 连接未就绪，无法同步会话'))
+    }
+    return new Promise<ConversationSyncPage>((resolve, reject) => {
+      const clientMsgId = createClientMsgId()
+      const request: PendingConversationSyncRequest = {
+        clientMsgId,
+        conversationId: conversation.conversationId,
+        afterSeq,
+        afterChangeSeq,
+        epoch,
+        snapshotId,
+        resolve,
+        reject,
+        timer: 0
+      }
+      request.timer = window.setTimeout(() => {
+        rejectConversationSyncRequest(
+          clientMsgId,
+          new Error('会话 SYNC 响应超时')
+        )
+      }, CONTROL_REQUEST_TIMEOUT_MS)
+      pendingConversationSyncRequests.set(clientMsgId, request)
+      if (!sendPacketToSocket(current, {
+        cmd: 'sync',
+        client_msg_id: clientMsgId,
+        data: {
+          conversation_id: conversation.conversationId,
+          after_seq: afterSeq,
+          after_change_seq: afterChangeSeq,
+          limit: CONVERSATION_SYNC_PAGE_LIMIT
+        }
+      })) {
+        rejectConversationSyncRequest(
+          clientMsgId,
+          new Error('IM 连接未就绪，无法同步会话')
+        )
+      }
+    })
+  }
+
+  function validateConversationSyncPage(
+    data: Record<string, any>,
+    request: PendingConversationSyncRequest,
+    conversation: ImConversation
+  ): ConversationSyncPage | null {
+    const nextAfterSeq = Number(data.next_after_seq ?? -1)
+    const nextAfterChangeSeq = Number(data.next_after_change_seq ?? -1)
+    const snapshotId = normalizeAccessSnapshotId(
+      data.cross_org_access_snapshot_id
+    )
+    if (
+      data.scope !== 'conversation' ||
+      String(data.conversation_id ?? '').trim() !== request.conversationId ||
+      !Array.isArray(data.messages) ||
+      !Array.isArray(data.changes) ||
+      !Number.isSafeInteger(nextAfterSeq) ||
+      nextAfterSeq < request.afterSeq ||
+      !Number.isSafeInteger(nextAfterChangeSeq) ||
+      nextAfterChangeSeq < request.afterChangeSeq ||
+      typeof data.messages_has_more !== 'boolean' ||
+      typeof data.changes_has_more !== 'boolean' ||
+      !snapshotId ||
+      (data.messages_has_more && nextAfterSeq <= request.afterSeq) ||
+      (data.changes_has_more &&
+        nextAfterChangeSeq <= request.afterChangeSeq)
+    ) {
+      return null
+    }
+
+    let previousMessageSequence = request.afterSeq
+    const packetMessages: ImPacketMessage[] = []
+    for (const value of data.messages) {
+      if (!isRecord(value)) return null
+      const messageSequence = Number(value.message_seq ?? 0)
+      if (
+        !isMessageValidForConversation(
+          value,
+          session().organization,
+          session().user.userId,
+          conversation
+        ) ||
+        messageSequence <= previousMessageSequence ||
+        messageSequence > nextAfterSeq
+      ) {
+        return null
+      }
+      previousMessageSequence = messageSequence
+      packetMessages.push(value as ImPacketMessage)
+    }
+
+    let previousChangeSequence = request.afterChangeSeq
+    const changes: ConversationSyncChange[] = []
+    for (const value of data.changes) {
+      if (!isRecord(value) || !isRecord(value.payload)) return null
+      const changeSequence = Number(value.change_seq ?? 0)
+      const messageSequence = Number(value.message_seq ?? 0)
+      const changeType = String(value.change_type ?? '')
+      const targetUserId = value.target_user_id == null
+        ? null
+        : String(value.target_user_id).trim()
+      const targetOrganization = value.target_organization == null
+        ? null
+        : normalizeImOrganization(value.target_organization)
+      const validType = changeType === 'recall' ||
+        changeType === 'edit' ||
+        changeType === 'delete_both' ||
+        changeType === 'delete_self'
+      const validTarget = changeType === 'delete_self'
+        ? isSameImIdentity(
+            targetOrganization,
+            targetUserId,
+            session().organization,
+            session().user.userId
+          )
+        : targetOrganization === null && targetUserId === null
+      const validPayload =
+        (changeType === 'recall' &&
+          value.payload.status === 'recalled') ||
+        (changeType === 'edit' &&
+          isRecord(value.payload.content) &&
+          typeof value.payload.content.text === 'string' &&
+          value.payload.content.text.trim() !== '') ||
+        (changeType === 'delete_both' &&
+          value.payload.scope === 'both') ||
+        (changeType === 'delete_self' &&
+          value.payload.scope === 'self')
+      if (
+        String(value.conversation_id ?? '').trim() !==
+          request.conversationId ||
+        !String(value.message_id ?? '').trim() ||
+        !Number.isSafeInteger(messageSequence) ||
+        messageSequence <= 0 ||
+        !Number.isSafeInteger(changeSequence) ||
+        changeSequence <= previousChangeSequence ||
+        changeSequence > nextAfterChangeSeq ||
+        !validType ||
+        !validTarget ||
+        !validPayload
+      ) {
+        return null
+      }
+      previousChangeSequence = changeSequence
+      changes.push({
+        conversation_id: request.conversationId,
+        change_seq: changeSequence,
+        change_type: changeType,
+        message_id: String(value.message_id),
+        message_seq: messageSequence,
+        target_organization: targetOrganization,
+        target_user_id: targetUserId,
+        payload: value.payload,
+        create_time: typeof value.create_time === 'string'
+          ? value.create_time
+          : undefined
+      } as ConversationSyncChange)
+    }
+
+    return {
+      scope: 'conversation',
+      conversation_id: request.conversationId,
+      messages: packetMessages,
+      changes,
+      next_after_seq: nextAfterSeq,
+      next_after_change_seq: nextAfterChangeSeq,
+      messages_has_more: data.messages_has_more,
+      changes_has_more: data.changes_has_more,
+      cross_org_access_snapshot_id: snapshotId,
+      access_snapshot_behind_high_water: false
+    }
+  }
+
+  function applyConversationSyncChange(
+    conversation: ImConversation,
+    change: ConversationSyncChange
+  ) {
+    const original = (messages.value[conversation.id] ?? []).find(
+      (message) => message.messageId === change.message_id
+    )
+    if (
+      original &&
+      Number(original.messageSeq ?? 0) !== change.message_seq
+    ) {
+      throw new Error('会话 SYNC 变更与本地 message_seq 不一致')
+    }
+    if (original) {
+      if (
+        change.change_type === 'recall' ||
+        change.change_type === 'delete_both' ||
+        change.change_type === 'delete_self'
+      ) {
+        removeDeletedMessage(
+          conversation.conversationId,
+          change.message_id,
+          {}
+        )
+      } else {
+        if (original.type !== 'text') {
+          throw new Error('会话 SYNC 编辑变更指向非文本消息')
+        }
+        const content = isRecord(change.payload.content)
+          ? change.payload.content
+          : null
+        if (!content || typeof content.text !== 'string') {
+          throw new Error('会话 SYNC 编辑变更缺少文本内容')
+        }
+        updateLocalMessage(conversation.id, original.id, {
+          content: content.text,
+          editTime: String(change.payload.edit_time ?? change.create_time ?? ''),
+          editCount: Number(change.payload.edit_count ?? original.editCount ?? 0)
+        })
+      }
+    }
+    messageChangeCursors.set(
+      mutationCursorKey(conversation.conversationId, change.message_id),
+      change.change_seq
+    )
+  }
+
+  function applyConversationSyncPage(
+    conversation: ImConversation,
+    page: ConversationSyncPage,
+    epoch: ConversationAccessEpochToken
+  ) {
+    assertConversationAccessEpochCurrent(epoch)
+    const mappedMessages = page.messages.map((message) =>
+      mapPacketMessage(message, session(), conversation)
+    )
+    for (const message of mappedMessages) {
+      appendMessage(conversation.id, message)
+    }
+    for (const change of page.changes) {
+      applyConversationSyncChange(conversation, change)
+    }
+    assertConversationAccessEpochCurrent(epoch)
+    messageCursors.set(conversation.id, page.next_after_seq)
+    conversationChangeCursors.set(
+      mutationCursorKey(conversation.conversationId),
+      page.next_after_change_seq
+    )
+    conversations.value = conversations.value.map((item) =>
+      item.id === conversation.id
+        ? {
+            ...item,
+            lastChangeSeq: Math.max(
+              Number(item.lastChangeSeq ?? 0),
+              page.next_after_change_seq
+            )
+          }
+        : item
+    )
+  }
+
+  async function syncConversationFromCursors(conversation: ImConversation) {
+    let afterSeq = messageCursors.get(conversation.id) ??
+      maxLocalMessageSeq(messages.value[conversation.id] ?? [])
+    let afterChangeSeq = conversationChangeCursors.get(
+      mutationCursorKey(conversation.conversationId)
+    ) ?? 0
+    for (let pageCount = 0; pageCount < 1000; pageCount += 1) {
+      let page: ConversationSyncPage
+      try {
+        page = await requestConversationSyncPage(
+          conversation,
+          afterSeq,
+          afterChangeSeq
+        )
+      } catch (error) {
+        if (
+          error instanceof ConversationAccessEpochChangedError &&
+          !isCrossOrgSingle(conversation)
+        ) {
+          page = await requestConversationSyncPage(
+            conversation,
+            afterSeq,
+            afterChangeSeq
+          )
+        } else {
+          throw error
+        }
+      }
+      const epoch = captureAccessEpoch()
+      if (
+        (
+          epoch.snapshotId !== page.cross_org_access_snapshot_id &&
+          !page.access_snapshot_behind_high_water
+        ) ||
+        (epoch.snapshotId === '0' && isCrossOrgSingle(conversation))
+      ) {
+        throw new Error('会话 SYNC 快照已变化')
+      }
+      applyConversationSyncPage(conversation, page, epoch)
+      afterSeq = page.next_after_seq
+      afterChangeSeq = page.next_after_change_seq
+      if (!page.messages_has_more && !page.changes_has_more) return
+    }
+    throw new Error('会话 SYNC 分页超过安全上限')
+  }
+
+  async function refreshConversationHistoryForChange(
+    conversation: ImConversation,
+    incomingChangeSequence: number,
+    messageId: string
+  ) {
+    const key = mutationCursorKey(conversation.conversationId)
+    const currentRefresh = changeRefreshInFlight.get(key)
+    if (currentRefresh) return currentRefresh
+    const refreshSocket = socket
+    const refreshEpoch = captureAccessEpoch()
+    let refresh: Promise<void>
+    refresh = (async () => {
+      await syncConversationFromCursors(conversation)
+      if (
+        (conversationChangeCursors.get(key) ?? 0) < incomingChangeSequence
+      ) {
+        throw new Error('会话 SYNC 尚未追平变更水位')
+      }
+      await loadConversations()
+    })().catch((error) => {
+      if (
+        error instanceof ConversationAccessEpochChangedError ||
+        !isConversationAccessEpochCurrent(refreshEpoch) ||
+        !refreshSocket ||
+        socket !== refreshSocket ||
+        authenticatedConnection?.socket !== refreshSocket
+      ) {
+        return
+      }
+      logWsStatus('mutation:authoritative-refresh-failed', {
+        conversationId: conversation.conversationId,
+        messageId,
+        error: error instanceof Error ? error.message : String(error)
+      })
+      failCloseCrossOrgAccess(false)
+      failSocketAuthentication(
+        refreshSocket,
+        'mutation:authoritative-refresh-failed',
+        '消息变更缺口的权威同步失败，正在重新连接'
+      )
+      scheduleReconnect()
+    }).finally(() => {
+      if (changeRefreshInFlight.get(key) === refresh) {
+        changeRefreshInFlight.delete(key)
+      }
+    })
+    changeRefreshInFlight.set(key, refresh)
+    return refresh
+  }
+
+  function applyDurableMutation(
+    command: 'recall' | 'edit' | 'delete',
+    data: Record<string, any>
+  ) {
+    const conversationId = String(data.conversation_id ?? '').trim()
+    const messageId = String(data.message_id ?? '').trim()
+    const incomingChangeSequence = Number(data.change_seq ?? 0)
+    const conversation = conversations.value.find(
+      (item) => item.conversationId === conversationId
+    )
+    if (!conversation || !messageId) return false
+    const conversationCursorKey = mutationCursorKey(conversationId)
+    const messageCursorKey = mutationCursorKey(conversationId, messageId)
+    const decision = classifyMutationChangeSequence(
+      conversationChangeCursors.get(conversationCursorKey) ?? 0,
+      messageChangeCursors.get(messageCursorKey) ?? 0,
+      incomingChangeSequence
+    )
+    if (decision === 'invalid') return false
+    if (decision === 'stale') return true
+    const original = (messages.value[conversation.id] ?? []).find(
+      (message) => message.messageId === messageId
+    )
+    if (decision === 'gap' || !original) {
+      void refreshConversationHistoryForChange(
+        conversation,
+        incomingChangeSequence,
+        messageId
+      )
+      return true
+    }
+    if (!isDurableMutationValidForContext(
+      command,
+      data,
+      session().organization,
+      session().user.userId,
+      conversation,
+      {
+        conversationId,
+        messageId,
+        messageSeq: Number(original.messageSeq ?? 0),
+        senderOrganization: original.senderOrganization,
+        senderUserId: original.senderUserId,
+        messageType: original.type === 'text' ? MESSAGE_TYPE_TEXT : 0,
+        side: original.side
+      }
+    )) {
+      return false
+    }
+
+    if (command === 'recall') {
+      const noticeMessage = data.notice_message as ImPacketMessage | undefined
+      if (noticeMessage && (
+        noticeMessage.conversation_id !== conversationId ||
+        normalizeImOrganization(noticeMessage.organization) !== session().organization ||
+        !isMessageValidForConversation(
+          noticeMessage as unknown as Record<string, unknown>,
+          session().organization,
+          session().user.userId,
+          conversation
+        ) ||
+        !isSameImIdentity(
+          noticeMessage.content?.actor_organization,
+          noticeMessage.content?.actor_user_id,
+          data.actor_organization,
+          data.actor_user_id
+        )
+      )) {
+        return false
+      }
+      removeRecalledMessage(conversationId, messageId)
+      if (noticeMessage) applyNoticeMessage(noticeMessage, data)
+    } else if (command === 'edit') {
+      applyEditedMessage(data.message as ImPacketMessage, data)
+    } else {
+      removeDeletedMessage(conversationId, messageId, data)
+    }
+    conversationChangeCursors.set(conversationCursorKey, incomingChangeSequence)
+    messageChangeCursors.set(messageCursorKey, incomingChangeSequence)
+    void loadConversations()
+    return true
+  }
+
+  function applyMutationAck(
+    expected: PendingImControlRequest,
+    data: Record<string, any>
+  ) {
+    if (
+      expected.command !== 'recall' &&
+      expected.command !== 'edit' &&
+      expected.command !== 'delete'
+    ) return false
+    const conversation = conversations.value.find(
+      (item) => item.conversationId === expected.conversationId
+    )
+    if (!conversation || !expected.messageId) return false
+    const incomingChangeSequence = Number(data.change_seq ?? 0)
+    const conversationCursorKey = mutationCursorKey(expected.conversationId)
+    const messageCursorKey = mutationCursorKey(
+      expected.conversationId,
+      expected.messageId
+    )
+    const decision = classifyMutationChangeSequence(
+      conversationChangeCursors.get(conversationCursorKey) ?? 0,
+      messageChangeCursors.get(messageCursorKey) ?? 0,
+      incomingChangeSequence
+    )
+    if (decision === 'invalid') return false
+    if (decision === 'stale') return true
+    const original = (messages.value[conversation.id] ?? []).find(
+      (message) => message.messageId === expected.messageId
+    )
+    if (decision === 'gap' || !original) {
+      void refreshConversationHistoryForChange(
+        conversation,
+        incomingChangeSequence,
+        expected.messageId
+      )
+      return true
+    }
+    const currentIsSender = isSameImIdentity(
+      original.senderOrganization,
+      original.senderUserId,
+      session().organization,
+      session().user.userId
+    )
+    if (
+      (expected.command === 'recall' || expected.command === 'edit' ||
+        (expected.command === 'delete' && expected.scope === 'both')) &&
+      !currentIsSender
+    ) {
+      return false
+    }
+
+    if (expected.command === 'recall') {
+      const noticeMessage = data.notice_message as ImPacketMessage | undefined
+      if (noticeMessage && (
+        noticeMessage.conversation_id !== expected.conversationId ||
+        normalizeImOrganization(noticeMessage.organization) !== session().organization ||
+        !isMessageValidForConversation(
+          noticeMessage as unknown as Record<string, unknown>,
+          session().organization,
+          session().user.userId,
+          conversation
+        ) ||
+        !isSameImIdentity(
+          noticeMessage.content?.actor_organization,
+          noticeMessage.content?.actor_user_id,
+          session().organization,
+          session().user.userId
+        )
+      )) return false
+      removeRecalledMessage(expected.conversationId, expected.messageId)
+      if (noticeMessage) applyNoticeMessage(noticeMessage, data)
+    } else if (expected.command === 'edit') {
+      const message = data.message as ImPacketMessage | undefined
+      if (
+        !message ||
+        !isRecord(data.content) ||
+        typeof data.content.text !== 'string' ||
+        data.content.text.trim() === '' ||
+        message.conversation_id !== expected.conversationId ||
+        normalizeImOrganization(message.organization) !== session().organization ||
+        message.message_id !== expected.messageId ||
+        Number(message.message_seq ?? 0) !== Number(original.messageSeq ?? 0) ||
+        Number(message.message_type ?? 0) !== MESSAGE_TYPE_TEXT ||
+        String(message.content?.text ?? '') !== data.content.text ||
+        !isSameImIdentity(
+          message.sender_organization,
+          message.sender_id,
+          original.senderOrganization,
+          original.senderUserId
+        ) ||
+        !isMessageValidForConversation(
+          message as unknown as Record<string, unknown>,
+          session().organization,
+          session().user.userId,
+          conversation
+        )
+      ) return false
+      applyEditedMessage(message, data)
+    } else {
+      removeDeletedMessage(expected.conversationId, expected.messageId, data)
+    }
+    conversationChangeCursors.set(conversationCursorKey, incomingChangeSequence)
+    messageChangeCursors.set(messageCursorKey, incomingChangeSequence)
+    void loadConversations()
+    return true
+  }
+
+  function applyScreenshotAck(
+    expected: PendingImControlRequest,
+    data: Record<string, any>
+  ) {
+    if (expected.command !== 'screenshot') return false
+    const conversation = conversations.value.find(
+      (item) => item.conversationId === expected.conversationId
+    )
+    if (!conversation) return false
+    const noticeMessage = data.notice_message as ImPacketMessage | undefined
+    if (data.enabled === false) return noticeMessage === undefined || noticeMessage === null
+    if (
+      data.enabled !== true ||
+      !noticeMessage ||
+      noticeMessage.conversation_id !== expected.conversationId ||
+      normalizeImOrganization(noticeMessage.organization) !== session().organization ||
+      !isMessageValidForConversation(
+        noticeMessage as unknown as Record<string, unknown>,
+        session().organization,
+        session().user.userId,
+        conversation
+      ) ||
+      !isSameImIdentity(
+        noticeMessage.content?.actor_organization,
+        noticeMessage.content?.actor_user_id,
+        session().organization,
+        session().user.userId
+      )
+    ) return false
+    applyNoticeMessage(noticeMessage, data)
+    return true
+  }
+
+  function clearConversationRuntime(conversation: ImConversation) {
+    const conversationId = conversation.conversationId
+    const nextMessages = { ...messages.value }
+    delete nextMessages[conversation.id]
+    messages.value = nextMessages
+    messageCursors.delete(conversation.id)
+    messageBeforeCursors.delete(conversation.id)
+    messageHasMoreBefore.delete(conversation.id)
+    conversationReadCursors.delete(mutationCursorKey(conversationId))
+    conversationChangeCursors.delete(mutationCursorKey(conversationId))
+    for (const key of messageChangeCursors.keys()) {
+      if (key.startsWith(mutationCursorKey(conversationId))) {
+        messageChangeCursors.delete(key)
+      }
+    }
+    for (const request of [...pendingControlRequests.values()]) {
+      if (request.conversationId === conversationId) {
+        resolvePendingControlRequest(request.clientMsgId)
+        rejectAuthoritativeControlAck(
+          request.clientMsgId,
+          new Error('会话已失效，权威控制回执已取消')
+        )
+      }
+    }
+    const nextTyping = { ...typingByConversation.value }
+    delete nextTyping[conversationId]
+    typingByConversation.value = nextTyping
+    window.clearTimeout(typingTimers.get(conversationId) ?? 0)
+    typingTimers.delete(conversationId)
+  }
+
+  function clearCrossOrgPendingControlRequests() {
+    for (const request of [...pendingControlRequests.values()]) {
+      const conversation = conversations.value.find(
+        (item) => item.conversationId === request.conversationId
+      )
+      const isCrossOrg =
+        normalizeImOrganization(request.peerOrganization) !== '' &&
+        normalizeImOrganization(request.peerOrganization) !== session().organization ||
+        (
+          conversation?.conversationType === 'single' &&
+          normalizeImOrganization(conversation.peerOrganization) !== session().organization
+        )
+      if (!isCrossOrg) continue
+      resolvePendingControlRequest(request.clientMsgId)
+      rejectAuthoritativeControlAck(
+        request.clientMsgId,
+        new Error('跨机构访问已变化，权威控制回执已取消')
+      )
+      if (request.command === 'send') {
+        finishSendTrace(request.clientMsgId, 'IM_CROSS_ORG_ACCESS_REVOKED')
+        markLocalMessageFailed(request.clientMsgId)
+      }
+    }
+  }
+
+  function failCloseCrossOrgAccess(refresh = true) {
+    setCrossOrgAccessRecoveryRequired(true)
+    advanceConversationAccessEpoch(
+      session().organization,
+      session().user.userId
+    )
+    clearCrossOrgPendingControlRequests()
+    for (const request of [...pendingConversationSyncRequests.values()]) {
+      rejectConversationSyncRequest(
+        request.clientMsgId,
+        new ConversationAccessEpochChangedError()
+      )
+    }
+    accessSnapshotRebuild = null
+    restorableConversationIds.clear()
+    const retained: ImConversation[] = []
+    let removedActive = false
+    for (const conversation of conversations.value) {
+      if (!isCrossOrgSingle(conversation)) {
+        retained.push(conversation)
+        continue
+      }
+      if (conversation.conversationId) {
+        revokedConversationIds.add(conversation.conversationId)
+      }
+      clearConversationRuntime(conversation)
+      dispatchConversationAccessChanged(false, conversation, '', '', false)
+      if (conversation.id === activeConversationId.value) removedActive = true
+    }
+    dispatchConversationAccessChanged(false, null, '', '', refresh)
+    conversations.value = sortConversations(retained)
+    if (removedActive) {
+      activeConversationId.value = retained[0]?.id ?? ''
+      if (activeConversationId.value) void syncActiveConversation()
+    }
+  }
+
+  function dispatchConversationAccessChanged(
+    allowed: boolean,
+    conversation?: ImConversation | null,
+    peerOrganization = '',
+    peerUserId = '',
+    refresh = true
+  ) {
+    window.dispatchEvent(new CustomEvent(CONVERSATION_ACCESS_BROWSER_EVENT, {
+      detail: {
+        allowed,
+        refresh,
+        organization: conversation?.peerOrganization ?? peerOrganization,
+        userId: conversation?.peerUserId ?? peerUserId
+      }
+    }))
+  }
+
+  function revokeCrossOrgConversation(
+    conversationId: string,
+    peerOrganization: string,
+    peerUserId: string
+  ) {
+    revokedConversationIds.add(conversationId)
+    const conversation = conversations.value.find(
+      (item) =>
+        item.conversationId === conversationId ||
+        (
+          item.conversationType === 'single' &&
+          isSameImIdentity(
+            item.peerOrganization,
+            item.peerUserId,
+            peerOrganization,
+            peerUserId
+          )
+        )
+    )
+    if (!conversation) {
+      dispatchConversationAccessChanged(
+        false,
+        null,
+        peerOrganization,
+        peerUserId
+      )
+      return 'missing' as const
+    }
+    if (
+      conversation.conversationType !== 'single' ||
+      normalizeImOrganization(conversation.peerOrganization) === session().organization ||
+      !isSameImIdentity(
+        conversation.peerOrganization,
+        conversation.peerUserId,
+        peerOrganization,
+        peerUserId
+      )
+    ) {
+      return 'invalid' as const
+    }
+    if (conversation.conversationId) {
+      revokedConversationIds.add(conversation.conversationId)
+    }
+    clearConversationRuntime(conversation)
+    conversations.value = conversations.value.filter((item) => item.id !== conversation.id)
+    dispatchConversationAccessChanged(false, conversation)
+    if (activeConversationId.value === conversation.id) {
+      activeConversationId.value = conversations.value[0]?.id ?? ''
+      if (activeConversationId.value) void syncActiveConversation()
+    }
+    return 'removed' as const
+  }
+
+  async function reconcileCrossOrgAccessSnapshot(
+    snapshotId: string,
+    preserveRevokedConversationId = '',
+    _force = false,
+    restoreConversationId = ''
+  ): Promise<void> {
+    if (snapshotId === '0') {
+      failCloseCrossOrgAccess()
+      return
+    }
+    const epoch = captureAccessEpoch()
+    if (epoch.snapshotId !== snapshotId) return
+    if (restoreConversationId) {
+      restorableConversationIds.add(restoreConversationId)
+    }
+    if (
+      accessSnapshotRebuild &&
+      accessSnapshotRebuild.snapshotId === snapshotId &&
+      accessSnapshotRebuild.epoch.epoch === epoch.epoch
+    ) {
+      if (accessSnapshotRebuild.full || _force) {
+        return accessSnapshotRebuild.promise
+      }
+      const partialRebuild = accessSnapshotRebuild.promise
+      return partialRebuild.then(
+        () => reconcileCrossOrgAccessSnapshot(snapshotId),
+        (error: unknown) => {
+          if (error instanceof ConversationAccessEpochChangedError) {
+            return reconcileCrossOrgAccessSnapshot(snapshotId)
+          }
+          throw error
+        }
+      )
+    }
+    const rebuild = (async () => {
+      const fetched = await fetchConversations(
+        config(),
+        session(),
+        { authoritativeRecovery: true }
+      )
+      assertConversationAccessEpochCurrent(epoch)
+      if (currentAccessSnapshotId() !== snapshotId) {
+        throw new ConversationAccessEpochChangedError()
+      }
+      const acceptedIds = new Set(reconcileRevokedConversationIds(
+        revokedConversationIds,
+        fetched.map((conversation) => conversation.conversationId),
+        {
+          preserveRevokedConversationId,
+          restorableConversationIds,
+          restoreAllAuthoritative: !_force
+        }
+      ))
+      const loaded = fetched.filter((conversation) =>
+        acceptedIds.has(conversation.conversationId)
+      )
+      for (const conversationId of acceptedIds) {
+        restorableConversationIds.delete(conversationId)
+      }
+      const loadedById = new Map(loaded.map((conversation) => [
+        conversation.conversationId,
+        conversation
+      ]))
+      const next: ImConversation[] = []
+      for (const conversation of conversations.value) {
+        const replacement = loadedById.get(conversation.conversationId)
+        if (replacement) {
+          next.push(replacement)
+          loadedById.delete(conversation.conversationId)
+          continue
+        }
+        if (isCrossOrgSingle(conversation)) {
+          clearConversationRuntime(conversation)
+          dispatchConversationAccessChanged(
+            false,
+            conversation,
+            '',
+            '',
+            false
+          )
+        } else {
+          next.push(conversation)
+        }
+      }
+      next.push(...loadedById.values())
+      assertConversationAccessEpochCurrent(epoch)
+      conversations.value = sortConversations(next)
+      if (
+        activeConversationId.value &&
+        !conversations.value.some(
+          (item) => item.id === activeConversationId.value
+        )
+      ) {
+        activeConversationId.value = conversations.value[0]?.id ?? ''
+        if (activeConversationId.value) await syncActiveConversation()
+      }
+    })().finally(() => {
+      if (accessSnapshotRebuild?.promise === rebuild) {
+        accessSnapshotRebuild = null
+      }
+    })
+    accessSnapshotRebuild = {
+      snapshotId,
+      epoch,
+      full: !_force,
+      promise: rebuild
+    }
+    return rebuild
+  }
+
+  function handleConversationAccessChanged(current: WebSocket, packet: ImPacket) {
+    const event = parseConversationAccessChanged(
+      packet,
+      session().organization,
+      session().user.userId
+    )
+    if (!event) {
+      failSocketAuthentication(
+        current,
+        'protocol:invalid-conversation-access-event',
+        '跨机构会话访问变更事件协议或目标复合身份无效'
+      )
+      return
+    }
+    const observation = realtimeEventWindow().observe(event.eventId)
+    if (observation === 'duplicate') return
+    if (observation !== 'new') {
+      failSocketAuthentication(
+        current,
+        'protocol:invalid-conversation-access-event',
+        '跨机构会话访问变更事件幂等标识无效'
+      )
+      return
+    }
+    const snapshotObservation = observeAccessSnapshot(event.snapshotId)
+    if (snapshotObservation === 'stale') return
+    if (!shouldProcessAccessSnapshotEvent(snapshotObservation)) {
+      failSocketAuthentication(
+        current,
+        'protocol:invalid-conversation-access-snapshot',
+        '跨机构访问变更快照无效'
+      )
+      return
+    }
+    if (snapshotObservation === 'duplicate') {
+      advanceConversationAccessEpoch(
+        session().organization,
+        session().user.userId
+      )
+    }
+    if (authenticatedAccessSnapshotBehindHighWater) {
+      failSocketAuthentication(
+        current,
+        'access-snapshot:server-caught-up',
+        '跨机构访问快照已收敛，正在执行权威重建',
+        true
+      )
+      return
+    }
+    if (!event.allowed) {
+      restorableConversationIds.delete(event.conversationId)
+      clearCrossOrgPendingControlRequests()
+      const revokeResult = revokeCrossOrgConversation(
+        event.conversationId,
+        event.peerOrganization,
+        event.peerUserId
+      )
+      if (revokeResult === 'invalid') {
+        failSocketAuthentication(
+          current,
+          'protocol:invalid-conversation-access-target',
+          '跨机构会话访问撤销指向了非跨机构单聊'
+        )
+        return
+      }
+      void reconcileCrossOrgAccessSnapshot(
+        event.snapshotId,
+        event.conversationId,
+        true
+      ).then(() => {
+        if (
+          socket === current &&
+          connectionState.value === 'connected' &&
+          currentAccessSnapshotId() === event.snapshotId
+        ) {
+          setCrossOrgAccessRecoveryRequired(false)
+        }
+      }).catch((error) => {
+        if (
+          socket !== current ||
+          authenticatedConnection?.socket !== current ||
+          error instanceof ConversationAccessEpochChangedError
+        ) {
+          return
+        }
+        failCloseCrossOrgAccess(false)
+        logWsStatus('access-snapshot:revoke-refresh-failed', {
+          snapshotId: event.snapshotId,
+          error: error instanceof Error ? error.message : String(error)
+        })
+        failSocketAuthentication(
+          current,
+          'access-snapshot:revoke-refresh-failed',
+          '跨机构访问撤销后的权威重建失败'
+        )
+        scheduleReconnect()
+      })
+      return
+    }
+    void reconcileCrossOrgAccessSnapshot(
+      event.snapshotId,
+      '',
+      true,
+      event.conversationId
+    ).then(() => {
+      if (
+        socket === current &&
+        connectionState.value === 'connected' &&
+        currentAccessSnapshotId() === event.snapshotId &&
+        conversations.value.some(
+          (conversation) =>
+            conversation.conversationId === event.conversationId
+        )
+      ) {
+        setCrossOrgAccessRecoveryRequired(false)
+        dispatchConversationAccessChanged(
+          true,
+          null,
+          event.peerOrganization,
+          event.peerUserId
+        )
+      }
+    }).catch((error) => {
+      if (
+        socket !== current ||
+        authenticatedConnection?.socket !== current ||
+        error instanceof ConversationAccessEpochChangedError
+      ) {
+        return
+      }
+      failCloseCrossOrgAccess(false)
+      logWsStatus('access-snapshot:refresh-failed', {
+        snapshotId: event.snapshotId,
+        error: error instanceof Error ? error.message : String(error)
+      })
+      failSocketAuthentication(
+        current,
+        'access-snapshot:refresh-failed',
+        '跨机构访问授权后的权威重建失败'
+      )
+      scheduleReconnect()
+    })
+  }
+
+  function handleConversationSyncAck(current: WebSocket, packet: ImPacket) {
+    const clientMsgId = typeof packet.client_msg_id === 'string'
+      ? packet.client_msg_id.trim()
+      : ''
+    const request = pendingConversationSyncRequests.get(clientMsgId)
+    const conversation = request
+      ? conversations.value.find(
+          (item) => item.conversationId === request.conversationId
+        )
+      : null
+    if (!clientMsgId || !request || !conversation || !isRecord(packet.data)) {
+      failSocketAuthentication(
+        current,
+        'protocol:invalid-sync-ack-binding',
+        '会话 SYNC_ACK 未严格绑定当前请求',
+        true
+      )
+      return
+    }
+    const page = validateConversationSyncPage(
+      packet.data,
+      request,
+      conversation
+    )
+    if (!page) {
+      rejectConversationSyncRequest(
+        clientMsgId,
+        new Error('会话 SYNC_ACK 协议无效')
+      )
+      failSocketAuthentication(
+        current,
+        'protocol:invalid-sync-ack',
+        '会话 SYNC_ACK 游标、消息或变更流无效',
+        true
+      )
+      return
+    }
+
+    if (page.cross_org_access_snapshot_id !== request.snapshotId) {
+      const observation = observeAccessSnapshot(
+        page.cross_org_access_snapshot_id
+      )
+      const acceptedStaleSameOrgPage =
+        authenticatedAccessSnapshotBehindHighWater &&
+        !isCrossOrgSingle(conversation) &&
+        isExpectedStaleGlobalSyncSnapshot(
+          observation,
+          page.cross_org_access_snapshot_id,
+          authenticatedStaleAccessSnapshotId
+        )
+      if (acceptedStaleSameOrgPage) {
+        page.access_snapshot_behind_high_water = true
+      } else {
+      rejectConversationSyncRequest(
+        clientMsgId,
+        new ConversationAccessEpochChangedError()
+      )
+      if (observation === 'invalid' || observation === 'stale') {
+        failSocketAuthentication(
+          current,
+          'protocol:stale-sync-access-snapshot',
+          '会话 SYNC_ACK 的跨机构访问快照无效或已回滚',
+          true
+        )
+        return
+      }
+      if (
+        authenticatedAccessSnapshotBehindHighWater &&
+        shouldProcessAccessSnapshotEvent(observation)
+      ) {
+        failSocketAuthentication(
+          current,
+          'access-snapshot:server-caught-up',
+          '跨机构访问快照已收敛，正在执行权威重建',
+          true
+        )
+        return
+      }
+      if (observation === 'new') {
+        if (page.cross_org_access_snapshot_id === '0') {
+          failCloseCrossOrgAccess()
+        } else {
+          void reconcileCrossOrgAccessSnapshot(
+            page.cross_org_access_snapshot_id
+          ).then(() => {
+            if (
+              socket !== current ||
+              authenticatedConnection?.socket !== current ||
+              connectionState.value !== 'connected' ||
+              currentAccessSnapshotId() !==
+                page.cross_org_access_snapshot_id
+            ) {
+              return
+            }
+            setCrossOrgAccessRecoveryRequired(false)
+            dispatchConversationAccessChanged(true)
+          }).catch((error) => {
+            if (
+              socket !== current ||
+              authenticatedConnection?.socket !== current ||
+              error instanceof ConversationAccessEpochChangedError
+            ) {
+              return
+            }
+            failCloseCrossOrgAccess(false)
+            logWsStatus('access-snapshot:sync-refresh-failed', {
+              snapshotId: page.cross_org_access_snapshot_id,
+              error: error instanceof Error ? error.message : String(error)
+            })
+            failSocketAuthentication(
+              current,
+              'access-snapshot:sync-refresh-failed',
+              '会话同步后的跨机构访问权威重建失败'
+            )
+            scheduleReconnect()
+          })
+        }
+      }
+      return
+      }
+    }
+    if (
+      !isConversationAccessEpochCurrent(request.epoch) ||
+      (request.snapshotId === '0' && isCrossOrgSingle(conversation))
+    ) {
+      rejectConversationSyncRequest(
+        clientMsgId,
+        new ConversationAccessEpochChangedError()
+      )
+      return
+    }
+    window.clearTimeout(request.timer)
+    pendingConversationSyncRequests.delete(clientMsgId)
+    request.resolve(page)
+  }
+
+  function handleGlobalSyncAck(current: WebSocket, packet: ImPacket) {
+    const clientMsgId = typeof packet.client_msg_id === 'string'
+      ? packet.client_msg_id.trim()
+      : ''
+    const request = pendingGlobalSyncRequests.get(clientMsgId)
+    if (!clientMsgId || !request) return false
+    const page = validateGlobalSyncPage(packet.data, {
+      organization: session().organization,
+      afterGlobalSeq: request.afterGlobalSeq
+    })
+    if (!page) {
+      rejectGlobalSyncRequest(
+        clientMsgId,
+        new Error('全局 SYNC_ACK 协议、游标或消息流无效')
+      )
+      failSocketAuthentication(
+        current,
+        'protocol:invalid-global-sync-ack',
+        '全局 SYNC_ACK 未严格绑定请求或消息流无效',
+        true
+      )
+      return true
+    }
+    window.clearTimeout(request.timer)
+    pendingGlobalSyncRequests.delete(clientMsgId)
+    request.resolve(page)
+    return true
+  }
+
   function handleSocketMessage(current: WebSocket, event: MessageEvent<string>) {
     if (socket !== current) return
     let packet: ImPacket | null = null
@@ -1277,6 +3273,16 @@ export function useImRuntime(
     }
     if (!packet) return
 
+    handleSocketPacket(current, packet)
+  }
+
+  function handleSocketPacket(
+    current: WebSocket,
+    packet: ImPacket,
+    authoritativeConversationStateLoaded = false
+  ) {
+    if (socket !== current) return
+
     if (packet.cmd === 'auth') {
       handleAuthChallenge(current, packet)
       return
@@ -1285,15 +3291,12 @@ export function useImRuntime(
       handleAuthAck(current, packet)
       return
     }
-    if (packet.cmd === 'error' && connectionState.value !== 'connected') {
+    if (packet.cmd === 'error' && authenticatedConnection?.socket !== current) {
       const message = String(packet.data?.msg ?? 'IM 鉴权失败')
       failSocketAuthentication(current, 'auth:error-packet', message)
       return
     }
-    if (
-      connectionState.value !== 'connected' ||
-      authenticatedConnection?.socket !== current
-    ) {
+    if (authenticatedConnection?.socket !== current) {
       failSocketAuthentication(
         current,
         'auth:packet-before-ack',
@@ -1308,6 +3311,32 @@ export function useImRuntime(
         'protocol:organization-mismatch',
         'IM 响应 organization 与认证会话不一致'
       )
+      return
+    }
+    if (packet.cmd === CONVERSATION_ACCESS_CHANGED_COMMAND) {
+      handleConversationAccessChanged(current, packet)
+      return
+    }
+    if (packet.cmd === 'sync_ack') {
+      if (handleGlobalSyncAck(current, packet)) return
+      handleConversationSyncAck(current, packet)
+      return
+    }
+    if (packet.cmd === 'error' && connectionState.value !== 'connected') {
+      handleErrorPacket(packet)
+      return
+    }
+    if (connectionState.value !== 'connected') {
+      if (authenticatedRecoveryPackets.length >= AUTH_RECOVERY_BUFFER_LIMIT) {
+        failSocketAuthentication(
+          current,
+          'auth-recovery:buffer-overflow',
+          'IM 恢复期间实时事件超过安全上限',
+          true
+        )
+        return
+      }
+      authenticatedRecoveryPackets.push(packet)
       return
     }
     if (packet.cmd === 'friend_request') {
@@ -1342,7 +3371,9 @@ export function useImRuntime(
       // Canonical Rabbit events are state-changing broadcasts. Missing or
       // malformed event ids and schemas fail closed before any local mutation;
       // ACK/SYNC and other point-to-point commands are not subject to this gate.
-      if (!isCanonicalRealtimeEventPacketValid(packet, session().organization)) {
+      if (!isCanonicalRealtimeEventPacketValid(
+        packet, session().organization, session().user.userId
+      )) {
         failSocketAuthentication(
           current,
           'protocol:invalid-event-id',
@@ -1367,65 +3398,446 @@ export function useImRuntime(
     }
     if (packet.cmd === 'send_ack') {
       const message = packet.data?.message as ImPacketMessage | undefined
-      const clientMsgId = String(
-        packet.client_msg_id ?? packet.data?.client_msg_id ?? message?.client_msg_id ?? ''
-      )
-      finishSendTrace(clientMsgId)
-      if (message) {
-        upsertIncomingMessage(message)
+      const clientMsgId = String(packet.client_msg_id ?? '').trim()
+      const pending = pendingControlRequests.get(clientMsgId)
+      const completed = completedControlRequests.get(clientMsgId)
+      const expected = pending ?? completed
+      if (
+        !expected ||
+        expected.command !== 'send' ||
+        !isControlAckResponseValid(
+          packet,
+          expected,
+          session().organization,
+          session().user.userId
+        )
+      ) {
+        failSocketAuthentication(
+          current,
+          'protocol:invalid-send-ack',
+          'SEND_ACK 未绑定当前发送请求或消息元数据不一致'
+        )
+        return
       }
+      if (completed) return
+      finishSendTrace(clientMsgId)
+      if (!message || !upsertIncomingMessage(message, 'send_ack', expected)) {
+        failSocketAuthentication(
+          current,
+          'protocol:invalid-send-ack-message',
+          'SEND_ACK 消息发送者不属于当前会话'
+        )
+        return
+      }
+      completePendingControlRequest(clientMsgId)
       return
     }
     if (packet.cmd === 'push') {
       const message = packet.data?.message as ImPacketMessage | undefined
-      if (message) {
-        upsertIncomingMessage(message)
+      if (message && !upsertIncomingMessage(
+        message,
+        'push',
+        undefined,
+        true,
+        authoritativeConversationStateLoaded
+      )) {
+        failSocketAuthentication(
+          current,
+          'protocol:invalid-push-sender',
+          'PUSH 消息发送者不属于当前会话'
+        )
       }
+      return
+    }
+    if (packet.cmd === 'typing') {
+      if (!applyTypingEvent(packet.data ?? {})) {
+        failSocketAuthentication(
+          current,
+          'protocol:invalid-typing-event',
+          'IM 输入状态复合身份无效'
+        )
+      }
+      return
+    }
+    if (packet.cmd === 'ack') {
+      if (!applyReceiptEvent(packet.data ?? {})) {
+        failSocketAuthentication(
+          current,
+          'protocol:invalid-receipt-event',
+          'IM 回执复合身份或状态无效'
+        )
+      }
+      return
+    }
+    if (packet.cmd === 'conversation_read') {
+      if (!applyConversationReadEvent(packet.data ?? {})) {
+        failSocketAuthentication(
+          current,
+          'protocol:invalid-conversation-read-event',
+          'IM 会话已读复合身份或游标无效'
+        )
+      }
+      return
+    }
+    if (packet.cmd === 'ack_ack' || packet.cmd === 'conversation_read_ack') {
+      const clientMsgId = String(packet.client_msg_id ?? '').trim()
+      const pending = pendingControlRequests.get(clientMsgId)
+      const completed = completedControlRequests.get(clientMsgId)
+      const expected = pending ?? completed
+      if (!expected || !isControlAckResponseValid(
+        packet,
+        expected,
+        session().organization,
+        session().user.userId
+      )) {
+        failSocketAuthentication(
+          current,
+          'protocol:invalid-control-ack',
+          'IM 控制回执未绑定当前请求或复合身份无效'
+        )
+        return
+      }
+      if (!completed) completePendingControlRequest(clientMsgId)
       return
     }
     if (packet.cmd === 'friend_request') {
       handleFriendRequestEvent(packet.data ?? {})
       return
     }
-    if (packet.cmd === 'recall' || packet.cmd === 'recall_ack') {
-      const messageId = String(packet.data?.message_id ?? '')
-      const conversationId = String(packet.data?.conversation_id ?? '')
-      if (messageId && conversationId) {
-        removeRecalledMessage(conversationId, messageId)
-        const noticeMessage = packet.data?.notice_message as ImPacketMessage | undefined
-        if (noticeMessage) {
-          applyNoticeMessage(noticeMessage, packet.data ?? {})
-        }
-        void loadConversations()
+    if (
+      packet.cmd === 'recall_ack' ||
+      packet.cmd === 'edit_ack' ||
+      packet.cmd === 'delete_ack' ||
+      packet.cmd === 'screenshot_ack'
+    ) {
+      const clientMsgId = String(packet.client_msg_id ?? '').trim()
+      const pending = pendingControlRequests.get(clientMsgId)
+      const completed = completedControlRequests.get(clientMsgId)
+      const expected = pending ?? completed
+      if (
+        !expected ||
+        !isControlAckResponseValid(
+          packet,
+          expected,
+          session().organization,
+          session().user.userId
+        )
+      ) {
+        failSocketAuthentication(
+          current,
+          'protocol:invalid-mutation-ack',
+          'IM 变更确认未绑定当前请求或确认元数据不一致'
+        )
+        return
+      }
+      if (completed) return
+      const applied = expected.command === 'screenshot'
+        ? applyScreenshotAck(expected, packet.data ?? {})
+        : applyMutationAck(expected, packet.data ?? {})
+      if (!applied) {
+        failSocketAuthentication(
+          current,
+          'protocol:invalid-mutation-ack-state',
+          'IM 变更确认与本机原消息或系统提示不一致'
+        )
+        return
+      }
+      completePendingControlRequest(clientMsgId)
+      return
+    }
+    if (packet.cmd === 'recall' || packet.cmd === 'edit' || packet.cmd === 'delete') {
+      if (!applyDurableMutation(packet.cmd, packet.data ?? {})) {
+        failSocketAuthentication(
+          current,
+          'protocol:invalid-mutation-event',
+          'IM 持久变更的参与者、原消息或变更序列无效'
+        )
       }
       return
     }
-    if (packet.cmd === 'screenshot' || packet.cmd === 'screenshot_ack') {
+    if (packet.cmd === 'screenshot') {
+      const data = packet.data ?? {}
+      const conversationId = String(data.conversation_id ?? '').trim()
+      const conversation = conversations.value.find(
+        (item) => item.conversationId === conversationId
+      )
+      if (!conversation || !isConversationParticipantIdentity(
+        data.actor_organization,
+        data.actor_user_id,
+        session().organization,
+        session().user.userId,
+        conversation
+      )) {
+        failSocketAuthentication(
+          current,
+          'protocol:invalid-screenshot-event',
+          '截屏通知参与者复合身份无效'
+        )
+        return
+      }
       const noticeMessage = packet.data?.notice_message as ImPacketMessage | undefined
+      if (noticeMessage && (
+        noticeMessage.conversation_id !== conversationId ||
+        normalizeImOrganization(noticeMessage.organization) !== session().organization ||
+        !isMessageValidForConversation(
+          noticeMessage as unknown as Record<string, unknown>,
+          session().organization,
+          session().user.userId,
+          conversation
+        ) ||
+        !isSameImIdentity(
+          noticeMessage.content?.actor_organization,
+          noticeMessage.content?.actor_user_id,
+          data.actor_organization,
+          data.actor_user_id
+        )
+      )) {
+        failSocketAuthentication(
+          current,
+          'protocol:invalid-screenshot-notice',
+          '截屏系统提示发送者或 actor 复合身份无效'
+        )
+        return
+      }
       if (noticeMessage) {
         applyNoticeMessage(noticeMessage, packet.data ?? {})
-      }
-      return
-    }
-    if (packet.cmd === 'edit' || packet.cmd === 'edit_ack') {
-      const message = packet.data?.message as ImPacketMessage | undefined
-      if (message) {
-        applyEditedMessage(message, packet.data ?? {})
-      }
-      return
-    }
-    if (packet.cmd === 'delete' || packet.cmd === 'delete_ack') {
-      const messageId = String(packet.data?.message_id ?? '')
-      const conversationId = String(packet.data?.conversation_id ?? '')
-      if (messageId && conversationId) {
-        removeDeletedMessage(conversationId, messageId, packet.data ?? {})
-        void loadConversations()
       }
       return
     }
     if (packet.cmd === 'error') {
       handleErrorPacket(packet)
     }
+  }
+
+  async function recoverAuthenticatedConnection(
+    current: WebSocket,
+    recoverySequence: number,
+    staleServerSnapshotId = ''
+  ) {
+    const cachedConversationIds = new Set(
+      conversations.value
+        .filter((conversation) =>
+          !isCrossOrgSingle(conversation) &&
+          (messages.value[conversation.id] ?? []).length > 0
+        )
+        .map((conversation) => conversation.conversationId)
+    )
+    failCloseCrossOrgAccess(false)
+    for (let attempt = 0; attempt < GLOBAL_SYNC_MAX_RESTARTS; attempt += 1) {
+      const attemptEpoch = captureAccessEpoch()
+      try {
+        const batch = await collectStableGlobalSync(
+          current,
+          staleServerSnapshotId
+        )
+        if (
+          socket !== current ||
+          authenticatedConnection?.socket !== current ||
+          recoverySequence !== authenticatedRecoverySequence
+        ) return
+        if (batch.accessSnapshotBehindHighWater) {
+          authenticatedStaleAccessSnapshotId = batch.accessSnapshotId
+        }
+        if (batch.accessSnapshotBehindHighWater) {
+          setCrossOrgAccessRecoveryRequired(true)
+          await loadConversations()
+        } else if (batch.accessSnapshotId === '0') {
+          failCloseCrossOrgAccess(false)
+          await loadConversations()
+        } else {
+          await reconcileCrossOrgAccessSnapshot(batch.accessSnapshotId)
+        }
+        assertConversationAccessEpochCurrent(batch.epoch)
+        const recoveredMessages = applyGlobalSyncMessages(batch)
+        await syncCachedConversationGaps(cachedConversationIds)
+        assertConversationAccessEpochCurrent(batch.epoch)
+        if (
+          socket !== current ||
+          authenticatedConnection?.socket !== current ||
+          recoverySequence !== authenticatedRecoverySequence
+        ) return
+        setCrossOrgAccessRecoveryRequired(
+          batch.accessSnapshotBehindHighWater ||
+          batch.accessSnapshotId === '0'
+        )
+        authenticatedAccessSnapshotBehindHighWater =
+          batch.accessSnapshotBehindHighWater
+        authenticatedStaleAccessSnapshotId =
+          batch.accessSnapshotBehindHighWater
+            ? batch.accessSnapshotId
+            : ''
+        const recoveredMessageIds = new Set(
+          recoveredMessages.map((message) => message.message_id)
+        )
+        const bufferedPackets = authenticatedRecoveryPackets
+        authenticatedRecoveryPackets = []
+        connectionState.value = 'connected'
+        const recoveredAckPromises: Promise<void>[] = []
+        for (const message of recoveredMessages) {
+          if (isSameImIdentity(
+            message.sender_organization,
+            message.sender_id,
+            session().organization,
+            session().user.userId
+          )) {
+            continue
+          }
+          const conversation = conversations.value.find(
+            (item) => item.conversationId === message.conversation_id
+          )
+          if (!conversation) continue
+          recoveredAckPromises.push(
+            acknowledgeRecoveredIncomingMessage(message, conversation)
+          )
+        }
+        await Promise.all(recoveredAckPromises)
+        assertConversationAccessEpochCurrent(batch.epoch)
+        for (const bufferedPacket of bufferedPackets) {
+          const bufferedMessage = bufferedPacket.cmd === 'push'
+            ? bufferedPacket.data?.message as ImPacketMessage | undefined
+            : undefined
+          const bufferedConversation = bufferedMessage
+            ? conversations.value.find(
+                (item) =>
+                  item.conversationId === bufferedMessage.conversation_id
+              )
+            : undefined
+          const bufferedMessageCovered = Boolean(
+            bufferedMessage?.message_id &&
+            (
+              recoveredMessageIds.has(bufferedMessage.message_id) ||
+              revokedConversationIds.has(bufferedMessage.conversation_id) ||
+              (
+                bufferedConversation &&
+                (messageCursors.get(bufferedConversation.id) ?? 0) >=
+                  Number(bufferedMessage.message_seq ?? 0)
+              )
+            )
+          )
+          if (
+            bufferedMessage &&
+            bufferedMessageCovered
+          ) {
+            if (!isCanonicalRealtimeEventPacketValid(
+              bufferedPacket,
+              session().organization,
+              session().user.userId
+            )) {
+              failSocketAuthentication(
+                current,
+                'protocol:invalid-recovered-push',
+                '恢复期间收到的 PUSH 协议或幂等标识无效'
+              )
+              scheduleReconnect()
+              return
+            }
+            const observation = realtimeEventWindow().observe(
+              bufferedPacket.data?.event_id
+            )
+            if (observation !== 'new' && observation !== 'duplicate') {
+              failSocketAuthentication(
+                current,
+                'protocol:invalid-recovered-push-event-id',
+                '恢复期间收到的 PUSH 幂等标识无效'
+              )
+              scheduleReconnect()
+              return
+            }
+            if (
+              !recoveredMessageIds.has(bufferedMessage.message_id) &&
+              bufferedConversation &&
+              !revokedConversationIds.has(bufferedMessage.conversation_id) &&
+              canRecoverGlobalSyncConversation(
+                batch.accessSnapshotBehindHighWater ||
+                  batch.accessSnapshotId === '0',
+                session().organization,
+                bufferedConversation
+              )
+            ) {
+              if (!isMessageValidForConversation(
+                bufferedMessage as unknown as Record<string, unknown>,
+                session().organization,
+                session().user.userId,
+                bufferedConversation
+              )) {
+                failSocketAuthentication(
+                  current,
+                  'protocol:invalid-recovered-push-context',
+                  '恢复期间收到的 PUSH 会话归属或复合身份无效',
+                  true
+                )
+                return
+              }
+              await acknowledgeRecoveredIncomingMessage(
+                bufferedMessage,
+                bufferedConversation
+              )
+            }
+            continue
+          }
+          handleSocketPacket(
+            current,
+            bufferedPacket,
+            Boolean(
+              bufferedMessage &&
+              bufferedConversation &&
+              Number(bufferedConversation.lastMessageSeq ?? 0) >=
+                Number(bufferedMessage.message_seq ?? 0)
+            )
+          )
+          if (
+            socket !== current ||
+            authenticatedConnection?.socket !== current ||
+            recoverySequence !== authenticatedRecoverySequence
+          ) {
+            scheduleReconnect()
+            return
+          }
+        }
+        if (!batch.accessSnapshotBehindHighWater) {
+          const cursorCommitted = await commitGlobalSyncRecoveryCursor(
+            syncCursorStore(),
+            batch.nextCursor,
+            async () => {
+              assertConversationAccessEpochCurrent(batch.epoch)
+              return socket === current &&
+                authenticatedConnection?.socket === current &&
+                recoverySequence === authenticatedRecoverySequence
+            }
+          )
+          if (!cursorCommitted) return
+        }
+        startPing()
+        dispatchConversationAccessChanged(
+          !batch.accessSnapshotBehindHighWater &&
+          batch.accessSnapshotId !== '0'
+        )
+        logWsStatus('connected:recovery-complete', {
+          previousGlobalSeq: batch.previousCursor,
+          nextGlobalSeq: batch.nextCursor,
+          recoveredMessages: batch.messages.length,
+          accessSnapshotId: batch.accessSnapshotId,
+          accessSnapshotBehindHighWater:
+            batch.accessSnapshotBehindHighWater
+        })
+        return
+      } catch (error) {
+        if (
+          socket === current &&
+          authenticatedConnection?.socket === current &&
+          recoverySequence === authenticatedRecoverySequence &&
+          (
+            error instanceof ConversationAccessEpochChangedError ||
+            !isConversationAccessEpochCurrent(attemptEpoch)
+          )
+        ) {
+          failCloseCrossOrgAccess(false)
+          continue
+        }
+        throw error
+      }
+    }
+    throw new Error('AUTH 恢复期间访问快照持续变化')
   }
 
   function handleAuthAck(current: WebSocket, packet: ImPacket) {
@@ -1436,6 +3848,9 @@ export function useImRuntime(
     const credentialSessionId =
       typeof data.credential_session_id === 'string' ? data.credential_session_id.trim() : ''
     const sessionId = typeof data.session_id === 'string' ? data.session_id.trim() : ''
+    const accessSnapshotId = normalizeAccessSnapshotId(
+      data.cross_org_access_snapshot_id
+    )
     const valid = Boolean(
       challenge &&
         challenge.socket === current &&
@@ -1448,7 +3863,8 @@ export function useImRuntime(
         deviceId === challenge.deviceId &&
         credentialSessionId !== '' &&
         credentialSessionId === challenge.credentialSessionId &&
-        sessionId !== ''
+        sessionId !== '' &&
+        accessSnapshotId !== ''
     )
     if (!valid || !challenge) {
       challenge?.traceSpan?.fail({
@@ -1469,7 +3885,28 @@ export function useImRuntime(
       )
       return
     }
-
+    const accessSnapshotObservation = observeAccessSnapshot(accessSnapshotId)
+    const accessSnapshotDecision = classifyAuthAccessSnapshot(
+      accessSnapshotObservation,
+      accessSnapshotId,
+      currentAccessSnapshotId()
+    )
+    if (accessSnapshotDecision === 'invalid') {
+      challenge.traceSpan?.fail({
+        code: 'IM_AUTH_ACCESS_SNAPSHOT_INVALID',
+        type: 'protocol_error'
+      })
+      failSocketAuthentication(
+        current,
+        'auth-ack:invalid-access-snapshot',
+        'IM AUTH_ACK 的跨机构访问快照无效',
+        true
+      )
+      return
+    }
+    const accessSnapshotBehindHighWater =
+      accessSnapshotDecision === 'behind_high_water'
+    setCrossOrgAccessRecoveryRequired(true)
     authenticatedConnection = {
       socket: current,
       clientId,
@@ -1477,22 +3914,67 @@ export function useImRuntime(
       credentialSessionId,
       sessionId
     }
+    authenticatedAccessSnapshotBehindHighWater =
+      accessSnapshotBehindHighWater
+    authenticatedStaleAccessSnapshotId =
+      accessSnapshotBehindHighWater ? accessSnapshotId : ''
     pendingAuthChallenge = null
-    connectionState.value = 'connected'
     challenge.traceSpan?.end()
-    logWsStatus('connected:auth-ack', {
+    logWsStatus('authenticated:recovering', {
       hasClientId: true,
-      hasSessionId: true
+      hasSessionId: true,
+      accessSnapshotBehindHighWater
     })
-    startPing()
-    void loadConversations()
+    authenticatedRecoveryPackets = []
+    const recoverySequence = ++authenticatedRecoverySequence
+    void recoverAuthenticatedConnection(
+      current,
+      recoverySequence,
+      accessSnapshotBehindHighWater ? accessSnapshotId : ''
+    ).catch((error) => {
+      if (
+        socket !== current ||
+        authenticatedConnection?.socket !== current ||
+        recoverySequence !== authenticatedRecoverySequence
+      ) return
+      failCloseCrossOrgAccess(false)
+      logWsStatus('auth-recovery:failed', {
+        snapshotId: accessSnapshotId,
+        error: error instanceof Error ? error.message : String(error)
+      })
+      failSocketAuthentication(
+        current,
+        'auth-recovery:failed',
+        error instanceof Error ? error.message : 'IM 重连同步失败'
+      )
+      scheduleReconnect()
+    })
   }
 
   function handleErrorPacket(packet: ImPacket) {
     const message = String(packet.data?.msg ?? 'IM服务错误')
     const code = String(packet.data?.code ?? '')
-    const clientMsgId = String(packet.client_msg_id ?? packet.data?.client_msg_id ?? '')
+    const clientMsgId = String(packet.client_msg_id ?? '').trim()
     if (clientMsgId !== '') {
+      if (pendingGlobalSyncRequests.has(clientMsgId)) {
+        rejectGlobalSyncRequest(clientMsgId, new Error(message))
+        layer.error(message)
+        return
+      }
+      if (pendingConversationSyncRequests.has(clientMsgId)) {
+        rejectConversationSyncRequest(
+          clientMsgId,
+          new Error(message)
+        )
+        layer.error(message)
+        return
+      }
+      if (completedControlRequests.has(clientMsgId)) return
+      resolvePendingControlRequest(clientMsgId)
+      rejectAuthoritativeControlAck(
+        clientMsgId,
+        new Error(message)
+      )
       finishSendTrace(clientMsgId, code || 'IM_COMMAND_ERROR')
       markLocalMessageFailed(clientMsgId)
     }
@@ -1518,47 +4000,471 @@ export function useImRuntime(
     })
   }
 
-  function upsertIncomingMessage(message: ImPacketMessage) {
+  function applyTypingEvent(data: Record<string, any>) {
+    const conversationId = String(data.conversation_id ?? '').trim()
+    const actorOrganization = normalizeImOrganization(data.actor_organization)
+    const actorUserId = String(data.actor_user_id ?? '').trim()
+    const conversation = conversations.value.find(
+      (item) => item.conversationId === conversationId
+    )
+    if (!conversation || !actorOrganization || !actorUserId ||
+      isSameImIdentity(actorOrganization, actorUserId,
+        session().organization, session().user.userId)) return false
+    if (!isConversationParticipantIdentity(
+      actorOrganization,
+      actorUserId,
+      session().organization,
+      session().user.userId,
+      conversation
+    )) return false
+
+    const username = String(data.username ?? '').trim() || '对方'
+    typingByConversation.value = {
+      ...typingByConversation.value,
+      [conversationId]: `${username}正在输入…`
+    }
+    window.clearTimeout(typingTimers.get(conversationId) ?? 0)
+    typingTimers.set(conversationId, window.setTimeout(() => {
+      const next = { ...typingByConversation.value }
+      delete next[conversationId]
+      typingByConversation.value = next
+      typingTimers.delete(conversationId)
+    }, 3000))
+    return true
+  }
+
+  function sendMessageReceipt(
+    message: {
+      conversationId: string
+      messageId: string
+      messageSeq: number
+      senderOrganization: unknown
+      senderUserId: unknown
+    },
+    status: 'delivered' | 'read'
+  ) {
+    const clientMsgId = createClientMsgId()
+    registerPendingControlRequest({
+      command: 'ack',
+      clientMsgId,
+      conversationId: message.conversationId,
+      messageId: message.messageId,
+      messageSeq: message.messageSeq,
+      status,
+      senderOrganization: normalizeImOrganization(message.senderOrganization),
+      senderUserId: String(message.senderUserId ?? '').trim()
+    })
+    if (!sendPacket({
+      cmd: 'ack',
+      client_msg_id: clientMsgId,
+      data: { message_id: message.messageId, status }
+    })) {
+      resolvePendingControlRequest(clientMsgId)
+      return ''
+    }
+    return clientMsgId
+  }
+
+  function sendConversationReadReceipt(
+    conversationId: string,
+    messageId: string,
+    messageSeq: number
+  ) {
+    const clientMsgId = createClientMsgId()
+    registerPendingControlRequest({
+      command: 'conversation_read',
+      clientMsgId,
+      conversationId,
+      messageId,
+      messageSeq
+    })
+    if (!sendPacket({
+      cmd: 'conversation_read',
+      client_msg_id: clientMsgId,
+      data: { conversation_id: conversationId, last_read_message_id: messageId }
+    })) {
+      resolvePendingControlRequest(clientMsgId)
+      return ''
+    }
+    return clientMsgId
+  }
+
+  async function acknowledgeRecoveredIncomingMessage(
+    message: ImPacketMessage,
+    conversation: ImConversation
+  ) {
+    if (
+      isSameImIdentity(
+        message.sender_organization,
+        message.sender_id,
+        session().organization,
+        session().user.userId
+      ) ||
+      !(messages.value[conversation.id] ?? []).some(
+        (localMessage) => localMessage.messageId === message.message_id
+      )
+    ) {
+      return
+    }
+    const activeVisible = isActiveConversationVisible(conversation.id)
+    const receiptClientMsgId = sendMessageReceipt({
+      conversationId: message.conversation_id,
+      messageId: message.message_id,
+      messageSeq: Number(message.message_seq ?? 0),
+      senderOrganization: message.sender_organization,
+      senderUserId: message.sender_id
+    }, activeVisible ? 'read' : 'delivered')
+    if (!receiptClientMsgId) {
+      throw new Error('恢复消息回执未能加入 WebSocket 发送队列')
+    }
+    await waitForAuthoritativeControlAck(receiptClientMsgId)
+    if (activeVisible) {
+      setConversationReadLocal(conversation.id)
+      const readClientMsgId = sendConversationReadReceipt(
+        message.conversation_id,
+        message.message_id,
+        Number(message.message_seq ?? 0)
+      )
+      if (!readClientMsgId) {
+        throw new Error('恢复会话已读回执未能加入 WebSocket 发送队列')
+      }
+      await waitForAuthoritativeControlAck(readClientMsgId)
+    }
+  }
+
+  function upsertIncomingMessage(
+    message: ImPacketMessage,
+    source: 'send_ack' | 'push',
+    expectedSend?: PendingImControlRequest,
+    allowAuthoritativeReload = true,
+    authoritativeConversationStateLoaded = false
+  ) {
+    if (revokedConversationIds.has(message.conversation_id)) return true
+    if (
+      source === 'push' &&
+      isCrossOrgAccessFailClosed() &&
+      Number(message.conversation_type ?? 0) === 1 &&
+      normalizeImOrganization(message.sender_organization) !==
+        session().organization
+    ) {
+      return true
+    }
     let conversation: ImConversation | null | undefined = conversations.value.find(
       (item) => item.conversationId === message.conversation_id
     )
     if (!conversation) {
-      conversation = activeConversation.value
-      if (conversation && conversation.virtual) {
-        conversation.conversationId = message.conversation_id
-        conversation.id = message.conversation_id
-        conversation.virtual = false
-        messages.value[message.conversation_id] = messages.value[activeConversationId.value] ?? []
-        delete messages.value[activeConversationId.value]
-        messageCursors.set(message.conversation_id, messageCursors.get(activeConversationId.value) ?? 0)
-        messageBeforeCursors.set(message.conversation_id, messageBeforeCursors.get(activeConversationId.value) ?? 0)
-        messageHasMoreBefore.set(message.conversation_id, messageHasMoreBefore.get(activeConversationId.value) ?? false)
-        messageCursors.delete(activeConversationId.value)
-        messageBeforeCursors.delete(activeConversationId.value)
-        messageHasMoreBefore.delete(activeConversationId.value)
-        activeConversationId.value = message.conversation_id
+      const virtualConversation = source === 'send_ack'
+        ? conversations.value.find((item) =>
+            item.virtual &&
+            isSameImIdentity(
+              item.peerOrganization,
+              item.peerUserId,
+              expectedSend?.peerOrganization,
+              expectedSend?.peerUserId
+            ) &&
+            (messages.value[item.id] ?? []).some(
+              (localMessage) => localMessage.id === message.client_msg_id
+            )
+          )
+        : activeConversation.value?.virtual
+          ? activeConversation.value
+          : null
+      conversation = virtualConversation
+      if (conversation) {
+        const fromVirtualPeer = isSameImIdentity(
+          message.sender_organization,
+          message.sender_id,
+          conversation.peerOrganization,
+          conversation.peerUserId
+        )
+        const currentIdentity = isSameImIdentity(
+          message.sender_organization,
+          message.sender_id,
+          session().organization,
+          session().user.userId
+        )
+        const matchesPendingSend =
+          source === 'send_ack' &&
+          currentIdentity &&
+          (messages.value[conversation.id] ?? []).some(
+            (item) => item.id === message.client_msg_id
+          )
+        if (!fromVirtualPeer && !matchesPendingSend) {
+          void loadConversations()
+          return false
+        }
+        const virtualId = conversation.id
+        const materialized = {
+          ...conversation,
+          conversationId: message.conversation_id,
+          id: message.conversation_id,
+          virtual: false
+        }
+        conversations.value = conversations.value.map((item) =>
+          item.id === virtualId ? materialized : item
+        )
+        messages.value[message.conversation_id] = messages.value[virtualId] ?? []
+        delete messages.value[virtualId]
+        messageCursors.set(message.conversation_id, messageCursors.get(virtualId) ?? 0)
+        messageBeforeCursors.set(message.conversation_id, messageBeforeCursors.get(virtualId) ?? 0)
+        messageHasMoreBefore.set(message.conversation_id, messageHasMoreBefore.get(virtualId) ?? false)
+        messageCursors.delete(virtualId)
+        messageBeforeCursors.delete(virtualId)
+        messageHasMoreBefore.delete(virtualId)
+        if (activeConversationId.value === virtualId) {
+          activeConversationId.value = message.conversation_id
+        }
+        conversation = materialized
       }
     }
-    if (!conversation) return
+    if (!conversation) {
+      if (!allowAuthoritativeReload) return false
+      const epoch = captureAccessEpoch()
+      const sourceSocket = socket
+      void loadConversations().then(() => {
+        assertConversationAccessEpochCurrent(epoch)
+        if (
+          !sourceSocket ||
+          socket !== sourceSocket ||
+          authenticatedConnection?.socket !== sourceSocket ||
+          revokedConversationIds.has(message.conversation_id)
+        ) {
+          return
+        }
+        if (!upsertIncomingMessage(
+          message,
+          source,
+          expectedSend,
+          false,
+          true
+        )) {
+          throw new Error('权威会话列表未包含 PUSH/SEND_ACK 对应会话')
+        }
+      }).catch((error) => {
+        if (
+          error instanceof ConversationAccessEpochChangedError ||
+          !isConversationAccessEpochCurrent(epoch)
+        ) {
+          return
+        }
+        logWsStatus('message:authoritative-conversation-refresh-failed', {
+          conversationId: message.conversation_id,
+          messageId: message.message_id,
+          error: error instanceof Error ? error.message : String(error)
+        })
+        if (sourceSocket && socket === sourceSocket) {
+          failCloseCrossOrgAccess(false)
+          failSocketAuthentication(
+            sourceSocket,
+            'message:authoritative-conversation-refresh-failed',
+            '新消息对应会话的权威刷新失败，正在重新连接'
+          )
+          scheduleReconnect()
+        }
+      })
+      return true
+    }
+    if (!isMessageValidForConversation(
+      message as unknown as Record<string, unknown>,
+      session().organization,
+      session().user.userId,
+      conversation
+    )) {
+      return false
+    }
 
-    const isIncoming = message.sender_id !== session().user.userId
+    const isIncoming = !isSameImIdentity(
+      message.sender_organization,
+      message.sender_id,
+      session().organization,
+      session().user.userId
+    )
     const activeVisible = isActiveConversationVisible(conversation.id)
-    const shouldCountUnread = isIncoming && !activeVisible
-    const shouldShowNotice = shouldCountUnread && !conversation.isMuted
-    appendPacketMessage(conversation, message)
+    const shouldCountUnread = isIncoming && !activeVisible &&
+      !authoritativeConversationStateLoaded
+    const shouldShowNotice = isIncoming && !activeVisible &&
+      !conversation.isMuted
+    appendPacketMessage(
+      conversation,
+      message,
+      source === 'send_ack' ? message.client_msg_id : ''
+    )
     messageCursors.set(
       conversation.id,
       Math.max(messageCursors.get(conversation.id) ?? 0, Number(message.message_seq ?? 0))
     )
-    const preview = messageText(message, session().user.userId, conversation.conversationType)
+    const preview = messageText(
+      message, session().organization, session().user.userId, conversation.conversationType
+    )
     updateConversationPreview(conversation.id, preview, formatImTime(message.create_time), shouldCountUnread ? 1 : 0, message.create_time)
     if (isIncoming) {
+      const receiptStatus = activeVisible ? 'read' : 'delivered'
+      sendMessageReceipt({
+        conversationId: message.conversation_id,
+        messageId: message.message_id,
+        messageSeq: Number(message.message_seq ?? 0),
+        senderOrganization: message.sender_organization,
+        senderUserId: message.sender_id
+      }, receiptStatus)
+      if (activeVisible) {
+        sendConversationReadReceipt(
+          message.conversation_id,
+          message.message_id,
+          Number(message.message_seq ?? 0)
+        )
+      }
       notifyIncomingMessage(conversation.title, preview, shouldShowNotice)
       if (shouldShowNotice) {
         notifyTitleIncomingMessage(conversation.title, preview)
       }
     }
     void nextTick().then(scrollMessagesToBottom)
+    return true
+  }
+
+  function advanceMessageDelivery(
+    conversationId: string,
+    messageId: string,
+    status: 'delivered' | 'read'
+  ) {
+    const conversation = conversations.value.find(
+      (item) => item.conversationId === conversationId
+    )
+    if (!conversation) return
+    const target = (messages.value[conversation.id] ?? []).find(
+      (message) => message.messageId === messageId
+    )
+    if (!target || target.side !== 'out') return
+    const current = target.state
+    const currentRank =
+      current === 'sent' || current === 'delivered' || current === 'read'
+        ? DELIVERY_STATE_RANK[current]
+        : 0
+    if (DELIVERY_STATE_RANK[status] <= currentRank) return
+    updateLocalMessage(conversation.id, target.id, { state: status })
+  }
+
+  function applyReceiptEvent(data: Record<string, any>) {
+    const messageId = String(data.message_id ?? '').trim()
+    const conversationId = String(data.conversation_id ?? '').trim()
+    const conversation = conversations.value.find(
+      (item) => item.conversationId === conversationId
+    )
+    if (!conversation) return false
+    const target = (messages.value[conversation.id] ?? []).find(
+      (message) => message.messageId === messageId
+    )
+    if (!target) return false
+    const direction = classifyReceiptEventDirection(
+      data,
+      session().organization,
+      session().user.userId,
+      conversation,
+      {
+        conversationId,
+        messageId,
+        messageSeq: Number(target.messageSeq ?? 0),
+        senderOrganization: target.senderOrganization,
+        senderUserId: target.senderUserId,
+        side: target.side
+      }
+    )
+    if (direction === 'invalid') return false
+    if (
+      Number(target.messageSeq ?? 0) !== Number(data.message_seq ?? 0) ||
+      !isSameImIdentity(
+        target.senderOrganization,
+        target.senderUserId,
+        data.sender_organization,
+        data.sender_id
+      )
+    ) return false
+    if (direction === 'peer_reads_current') {
+      if (target.side !== 'out') return false
+      advanceMessageDelivery(conversationId, messageId, data.status)
+    } else if (direction === 'current_reads_peer') {
+      if (target.side !== 'in' && target.side !== 'system') return false
+      if (data.status === 'read') {
+        const cursorKey = mutationCursorKey(conversationId)
+        const messageSeq = Number(data.message_seq ?? 0)
+        if (messageSeq > (conversationReadCursors.get(cursorKey) ?? 0)) {
+          conversationReadCursors.set(cursorKey, messageSeq)
+          setConversationReadLocal(conversation.id)
+        }
+      }
+    } else if (
+      isSameImIdentity(
+        data.user_organization,
+        data.user_id,
+        session().organization,
+        session().user.userId
+      ) &&
+      data.status === 'read'
+    ) {
+      const cursorKey = mutationCursorKey(conversationId)
+      const messageSeq = Number(data.message_seq ?? 0)
+      if (messageSeq > (conversationReadCursors.get(cursorKey) ?? 0)) {
+        conversationReadCursors.set(cursorKey, messageSeq)
+        setConversationReadLocal(conversation.id)
+      }
+    }
+    return true
+  }
+
+  function applyConversationReadEvent(data: Record<string, any>) {
+    const conversationId = String(data.conversation_id ?? '').trim()
+    const lastReadSeq = Number(data.last_read_seq ?? 0)
+    const conversation = conversations.value.find(
+      (item) => item.conversationId === conversationId
+    )
+    if (!conversation) return false
+    const direction = classifyConversationReadEventDirection(
+      data,
+      session().organization,
+      session().user.userId,
+      conversation
+    )
+    if (direction === 'invalid') return false
+    const lastReadMessageId = String(data.last_read_message_id ?? '').trim()
+    if (lastReadMessageId) {
+      const knownLastReadMessage = (messages.value[conversation.id] ?? []).find(
+        (message) => message.messageId === lastReadMessageId
+      )
+      if (
+        knownLastReadMessage &&
+        Number(knownLastReadMessage.messageSeq ?? 0) !== lastReadSeq
+      ) return false
+    }
+    if (
+      direction === 'current_reads_peer' ||
+      (
+        direction === 'group_member' &&
+        isSameImIdentity(
+          data.user_organization,
+          data.user_id,
+          session().organization,
+          session().user.userId
+        )
+      )
+    ) {
+      const cursorKey = mutationCursorKey(conversationId)
+      if (lastReadSeq > (conversationReadCursors.get(cursorKey) ?? 0)) {
+        conversationReadCursors.set(cursorKey, lastReadSeq)
+        setConversationReadLocal(conversation.id)
+      }
+      return true
+    }
+    if (direction === 'group_member') return true
+    for (const message of messages.value[conversation.id] ?? []) {
+      if (
+        message.side === 'out' &&
+        Number(message.messageSeq ?? 0) > 0 &&
+        Number(message.messageSeq ?? 0) <= lastReadSeq
+      ) {
+        advanceMessageDelivery(conversationId, String(message.messageId ?? ''), 'read')
+      }
+    }
+    return true
   }
 
   function removeRecalledMessage(conversationId: string, messageId: string) {
@@ -1609,7 +4515,12 @@ export function useImRuntime(
     if (String(data.last_message_id ?? packetMessage.message_id) === packetMessage.message_id) {
       updateConversationPreview(
         conversation.id,
-        messageText(packetMessage, session().user.userId, conversation.conversationType),
+        messageText(
+          packetMessage,
+          session().organization,
+          session().user.userId,
+          conversation.conversationType
+        ),
         formatImTime(String(data.last_message_time ?? packetMessage.create_time)),
         0,
         String(data.last_message_time ?? packetMessage.create_time)
@@ -1618,11 +4529,43 @@ export function useImRuntime(
   }
 
   function mergeMessages(conversation: ImConversation, packetMessages: ImPacketMessage[]) {
-    packetMessages.forEach((message) => appendPacketMessage(conversation, message))
+    const mappedMessages = packetMessages.map((message) =>
+      mapPacketMessage(message, session(), conversation)
+    )
+    mappedMessages.forEach((message) => appendMessage(conversation.id, message))
   }
 
-  function appendPacketMessage(conversation: ImConversation, packetMessage: ImPacketMessage) {
-    appendMessage(conversation.id, mapPacketMessage(packetMessage, session(), conversation))
+  function appendPacketMessage(
+    conversation: ImConversation,
+    packetMessage: ImPacketMessage,
+    optimisticClientMsgId = ''
+  ) {
+    const mapped = mapPacketMessage(packetMessage, session(), conversation)
+    if (optimisticClientMsgId) {
+      const list = messages.value[conversation.id] ?? []
+      const optimistic = list.find(
+        (message) => message.id === optimisticClientMsgId
+      )
+      if (optimistic) {
+        messages.value = {
+          ...messages.value,
+          [conversation.id]: sortMessagesByTimeline([
+            ...list.filter(
+              (message) =>
+                message.id !== optimisticClientMsgId &&
+                message.id !== mapped.id
+            ),
+            {
+              ...optimistic,
+              ...mapped,
+              localOrder: optimistic.localOrder ?? mapped.localOrder
+            }
+          ])
+        }
+        return
+      }
+    }
+    appendMessage(conversation.id, mapped)
   }
 
   function updateConversationMessageBounds(
@@ -1723,7 +4666,29 @@ export function useImRuntime(
 
   function persistConversationRead(conversation: ImConversation) {
     if (conversation.virtual || !conversation.conversationId) return
-    return markConversationReadApi(config(), session(), { conversationId: conversation.conversationId }).catch(() => {
+    if (isCrossOrgAccessFailClosed() && isCrossOrgSingle(conversation)) return
+    const latestIncoming = [...(messages.value[conversation.id] ?? [])]
+      .filter((message) => message.side === 'in' && message.messageId)
+      .sort((left, right) => Number(right.messageSeq ?? 0) - Number(left.messageSeq ?? 0))[0]
+    if (latestIncoming?.messageId) {
+      sendMessageReceipt({
+        conversationId: conversation.conversationId,
+        messageId: latestIncoming.messageId,
+        messageSeq: Number(latestIncoming.messageSeq ?? 0),
+        senderOrganization: latestIncoming.senderOrganization,
+        senderUserId: latestIncoming.senderUserId
+      }, 'read')
+      sendConversationReadReceipt(
+        conversation.conversationId,
+        latestIncoming.messageId,
+        Number(latestIncoming.messageSeq ?? 0)
+      )
+    }
+    return markConversationReadApi(config(), session(), {
+      conversationId: conversation.conversationId,
+      conversationType: conversation.conversationType,
+      peerOrganization: conversation.peerOrganization
+    }).catch(() => {
       // 已读落库失败不能影响聊天主链路，下次刷新会用后端未读数兜底。
     })
   }
@@ -1738,6 +4703,10 @@ export function useImRuntime(
 
   function markAllConversationsRead() {
     conversations.value = conversations.value.map((item) => ({ ...item, unread: 0 }))
+    if (isCrossOrgAccessFailClosed()) {
+      layer.warning('跨机构访问尚未初始化，已读状态暂未批量同步')
+      return Promise.resolve()
+    }
     return markConversationReadApi(config(), session(), { all: true }).catch(() => {
       layer.warning('已读状态同步失败，请稍后重试')
     })
@@ -1746,8 +4715,14 @@ export function useImRuntime(
   async function updateConversationSetting(conversationId: string, settings: { isPinned?: boolean; isMuted?: boolean }) {
     const conversation = conversations.value.find((item) => item.id === conversationId)
     if (!conversation || conversation.virtual) return
+    if (isCrossOrgAccessFailClosed() && isCrossOrgSingle(conversation)) {
+      layer.warning('当前跨机构访问已关闭')
+      return
+    }
     await updateConversationSettingApi(config(), session(), {
       conversationId: conversation.conversationId,
+      conversationType: conversation.conversationType,
+      peerOrganization: conversation.peerOrganization,
       ...settings
     })
     conversations.value = sortConversations(conversations.value.map((item) =>
@@ -1795,6 +4770,7 @@ export function useImRuntime(
             time: updated.time,
             lastMessageId: updated.lastMessageId,
             lastMessageSeq: updated.lastMessageSeq,
+            lastChangeSeq: updated.lastChangeSeq,
             lastMessageIndexId: updated.lastMessageIndexId,
             lastMessageTime: updated.lastMessageTime,
             sortTime: updated.sortTime
@@ -1941,10 +4917,19 @@ export function useImRuntime(
     }
     if (!target || authenticatedConnection?.socket === target) {
       authenticatedConnection = null
+      authenticatedAccessSnapshotBehindHighWater = false
+      authenticatedStaleAccessSnapshotId = ''
+      authenticatedRecoverySequence += 1
+      authenticatedRecoveryPackets = []
     }
   }
 
-  function failSocketAuthentication(target: WebSocket, status: string, message: string) {
+  function failSocketAuthentication(
+    target: WebSocket,
+    status: string,
+    message: string,
+    reconnect = false
+  ) {
     if (socket !== target) return
     pendingAuthChallenge?.traceSpan?.fail({
       code: status,
@@ -1954,6 +4939,7 @@ export function useImRuntime(
     connectionState.value = 'error'
     layer.error(message)
     closeSocket()
+    if (reconnect) scheduleReconnect()
   }
 
   function startPing() {
@@ -1985,6 +4971,12 @@ export function useImRuntime(
     window.clearInterval(pingTimer)
     pingTimer = 0
     failPendingSendTraces('IM_WEBSOCKET_CLOSED', 'connection_closed')
+    clearPendingControlRequests()
+    typingTimers.forEach((timer) => window.clearTimeout(timer))
+    typingTimers.clear()
+    typingByConversation.value = {}
+    changeRefreshInFlight.clear()
+    failCloseCrossOrgAccess(false)
     clearSocketAuthState()
     if (socket) {
       const current = socket
@@ -2035,6 +5027,7 @@ export function useImRuntime(
     activeConversationId,
     activeConversation,
     activeMessages,
+    activeTypingText,
     boot,
     loadConversations,
     startSingleChat,
@@ -2047,6 +5040,7 @@ export function useImRuntime(
     sendAsset,
     recallMessage,
     sendScreenshotNotice,
+    sendTyping,
     editMessage,
     deleteMessage,
     deleteMessages,

@@ -15,11 +15,23 @@ import type { TenantBrandConfig } from './tenantConfig.ts'
 import { formatImTime } from './time.ts'
 import type { TraceContext } from './telemetry.ts'
 import { getWebDeviceId } from './webDevice.ts'
+import { imIdentityKey, normalizeImOrganization } from './imIdentity.ts'
+import {
+  currentConversationAccessSnapshot,
+  isAccessSnapshotFailClosed,
+  isConversationAccessRecoveryRequired,
+  normalizeAccessSnapshotId
+} from './conversationAccess.ts'
 
 export { getWebDeviceId } from './webDevice.ts'
 
 interface WebImUserPayload {
   id?: string | number
+  organization?: string | number
+  organization_name?: string
+  company_name?: string
+  is_cross_organization?: boolean | number
+  display_name?: string
   user_id?: string
   account?: string
   nickname?: string
@@ -42,6 +54,7 @@ interface WebImUserPayload {
 interface WebImLoginPayload {
   organization?: string | number
   deployment_id?: string
+  cross_org_access_snapshot_id?: unknown
   token: {
     expires_in?: number
     access_token?: string
@@ -105,6 +118,7 @@ interface ConversationPayload {
   peer_user?: WebImUserPayload | null
   last_message_id?: string
   last_message_seq?: number | string
+  last_change_seq?: number | string
   last_message_index_id?: number | string
   last_message_summary?: string
   last_message_time?: string
@@ -182,6 +196,8 @@ interface FriendRequestPayload {
   status_text: string
   create_time: string
   handle_time: string
+  from_organization?: string | number
+  to_organization?: string | number
   from_user: WebImUserPayload | null
   to_user: WebImUserPayload | null
 }
@@ -190,6 +206,49 @@ const WINDOW_STORAGE_KEY = 'b8im_web_window_session'
 const LOCAL_RESOURCE_HOSTS = new Set(['127.0.0.1', 'localhost', '::1', '[::1]'])
 const PRIVATE_ASSET_CACHE_SKEW_SECONDS = 30
 const privateAssetUrlCache = new Map<string, CachedAssetUrl>()
+
+function isCrossOrgAccessFailClosed(session: WebImSession) {
+  return isConversationAccessRecoveryRequired(
+    session.organization,
+    session.user.userId
+  ) || isAccessSnapshotFailClosed(currentConversationAccessSnapshot(
+    session.organization,
+    session.user.userId
+  ))
+}
+
+function assertCrossOrgMutationAllowed(
+  session: WebImSession,
+  targetOrganization: unknown,
+  missingIdentityMessage: string,
+  failClosedMessage: string
+) {
+  const normalizedTarget = normalizeImOrganization(targetOrganization)
+  if (!normalizedTarget) throw new Error(missingIdentityMessage)
+  if (
+    isCrossOrgAccessFailClosed(session) &&
+    normalizedTarget !== session.organization
+  ) {
+    throw new Error(failClosedMessage)
+  }
+  return normalizedTarget
+}
+
+function assertConversationMutationAllowed(
+  session: WebImSession,
+  context: {
+    conversationType: 'single' | 'group'
+    peerOrganization?: string
+  }
+) {
+  if (context.conversationType === 'group') return
+  assertCrossOrgMutationAllowed(
+    session,
+    context.peerOrganization,
+    '单聊写操作缺少对端机构身份',
+    '跨机构访问尚未初始化，不能修改跨机构会话'
+  )
+}
 
 const firstText = (value: string) => (value.trim().slice(0, 1) || '用').toUpperCase()
 
@@ -310,6 +369,7 @@ function normalizeWindowSession(session: WebImSession): WebImSession {
     deploymentId: String(session.deploymentId ?? ''),
     apiServerUrl: String(session.apiServerUrl ?? ''),
     imServerUrl: String(session.imServerUrl ?? ''),
+    crossOrgAccessSnapshotId: normalizeAccessSnapshotId(session.crossOrgAccessSnapshotId),
     user: session.user
   }
 }
@@ -329,6 +389,16 @@ function normalizeAuthenticatedSession(
   const accessToken = String(data.token?.access_token ?? '')
   if (!accessToken) throw new Error(`${responseName}缺少 access token`)
   assertWebApiJwtContext(accessToken, config)
+  const user = mapWebImUser(data.user)
+  if (user.organization !== config.organization) {
+    throw new Error(`${responseName}的用户复合身份与发现上下文不一致`)
+  }
+  const crossOrgAccessSnapshotId = normalizeAccessSnapshotId(
+    data.cross_org_access_snapshot_id
+  )
+  if (!crossOrgAccessSnapshotId) {
+    throw new Error(`${responseName}缺少有效跨机构访问快照 ID`)
+  }
 
   return normalizeWindowSession({
     accessToken,
@@ -338,7 +408,8 @@ function normalizeAuthenticatedSession(
     deploymentId: config.deploymentId,
     apiServerUrl: config.serverInfo.apiServerUrl,
     imServerUrl: config.serverInfo.imServerUrl,
-    user: mapWebImUser(data.user)
+    crossOrgAccessSnapshotId,
+    user
   })
 }
 
@@ -349,16 +420,36 @@ function isValidSession(session: WebImSession, config: TenantBrandConfig) {
     session.deploymentId === config.deploymentId &&
     session.apiServerUrl === config.serverInfo.apiServerUrl &&
     session.imServerUrl === config.serverInfo.imServerUrl &&
+    normalizeAccessSnapshotId(session.crossOrgAccessSnapshotId) !== '' &&
     String(decodeJwtPayload(session.accessToken).device_id ?? '') === getWebDeviceId()
   )
 }
 
 export function mapWebImUser(payload: WebImUserPayload): WebImUser {
+  const organization = normalizeImOrganization(payload.organization)
+  const userId = String(payload.user_id ?? '').trim()
+  if (!organization || !userId) throw new Error('IM 用户缺少有效复合身份')
+  const nickname = String(payload.nickname ?? payload.account ?? '未命名用户')
+  const account = String(payload.account ?? '')
+  const companyName = String(payload.company_name ?? payload.organization_name ?? '')
+  const isCrossOrganization =
+    payload.is_cross_organization === true ||
+    Number(payload.is_cross_organization ?? 0) === 1
+  const baseDisplayName = nickname || account || userId
+  const displayName = String(payload.display_name ?? '').trim() ||
+    (isCrossOrganization && companyName
+      ? `${baseDisplayName} · ${companyName}`
+      : baseDisplayName)
   return {
     id: String(payload.id ?? ''),
-    userId: String(payload.user_id ?? ''),
-    account: String(payload.account ?? ''),
-    nickname: String(payload.nickname ?? payload.account ?? '未命名用户'),
+    organization,
+    organizationName: String(payload.organization_name ?? ''),
+    companyName,
+    isCrossOrganization,
+    displayName,
+    userId,
+    account,
+    nickname,
     signature: String(payload.signature ?? ''),
     avatarFileId: String(payload.avatar_file_id ?? ''),
     avatarUrl: String(payload.avatar_url ?? ''),
@@ -380,9 +471,13 @@ export function mapContact(payload: WebImUserPayload): Contact {
   const user = mapWebImUser(payload)
   return {
     id: user.id,
+    organization: user.organization,
+    organizationName: user.organizationName,
+    companyName: user.companyName,
+    isCrossOrganization: user.isCrossOrganization,
     userId: user.userId,
     account: user.account,
-    name: user.nickname,
+    name: user.displayName,
     avatar: firstText(user.nickname || user.account),
     avatarFileId: user.avatarFileId,
     avatarUrl: user.avatarUrl,
@@ -408,6 +503,8 @@ const mapFriendRequest = (payload: FriendRequestPayload): FriendRequest => {
     statusText: payload.status_text,
     createTime: payload.create_time,
     handleTime: payload.handle_time,
+    fromOrganization: normalizeImOrganization(payload.from_organization),
+    toOrganization: normalizeImOrganization(payload.to_organization),
     fromUser: payload.from_user ? mapWebImUser(payload.from_user) : null,
     toUser: payload.to_user ? mapWebImUser(payload.to_user) : null
   }
@@ -612,13 +709,26 @@ export async function updateWebAvatar(
 
 export async function fetchConversations(
   config: TenantBrandConfig,
-  session: WebImSession
+  session: WebImSession,
+  options: { authoritativeRecovery?: boolean } = {}
 ): Promise<ImConversation[]> {
   const data = await requestWebApi<ConversationPayload[]>(config, '/saimulti/web/im/conversations', {
     token: session.accessToken
   })
 
-  return data.map((item) => mapConversation(item))
+  const conversations = data.map((item) => mapConversation(item))
+  const failClosed = options.authoritativeRecovery
+    ? isAccessSnapshotFailClosed(currentConversationAccessSnapshot(
+        session.organization,
+        session.user.userId
+      ))
+    : isCrossOrgAccessFailClosed(session)
+  return failClosed
+    ? conversations.filter((conversation) =>
+        conversation.conversationType !== 'single' ||
+        conversation.peerOrganization === session.organization
+      )
+    : conversations
 }
 
 export async function fetchMessageGroups(
@@ -649,8 +759,14 @@ export async function createMessageGroup(
 export async function updateConversationGroup(
   config: TenantBrandConfig,
   session: WebImSession,
-  payload: { conversationId: string; messageGroupId: number }
+  payload: {
+    conversationId: string
+    messageGroupId: number
+    conversationType: 'single' | 'group'
+    peerOrganization?: string
+  }
 ) {
+  assertConversationMutationAllowed(session, payload)
   return requestWebApi<{ conversation_id: string; message_group_id: number; message_group_name: string }>(
     config,
     '/saimulti/web/im/updateConversationGroup',
@@ -682,7 +798,14 @@ export async function fetchMessageConfig(
 export async function fetchMessages(
   config: TenantBrandConfig,
   session: WebImSession,
-  params: { conversationId?: string; peerUserId?: string; afterSeq?: number; beforeSeq?: number; limit?: number }
+  params: {
+    conversationId?: string
+    peerOrganization?: string
+    peerUserId?: string
+    afterSeq?: number
+    beforeSeq?: number
+    limit?: number
+  }
 ) {
   return requestWebApi<{
     messages: ImPacketMessage[]
@@ -696,6 +819,7 @@ export async function fetchMessages(
       token: session.accessToken,
       query: {
         conversation_id: params.conversationId,
+        peer_organization: params.peerOrganization,
         peer_user_id: params.peerUserId,
         after_seq: params.afterSeq ?? 0,
         before_seq: params.beforeSeq ?? 0,
@@ -708,8 +832,26 @@ export async function fetchMessages(
 export async function markConversationRead(
   config: TenantBrandConfig,
   session: WebImSession,
-  params: { conversationId?: string; all?: boolean }
+  params: {
+    conversationId?: string
+    all?: boolean
+    conversationType?: 'single' | 'group'
+    peerOrganization?: string
+  }
 ) {
+  if (params.all) {
+    if (isCrossOrgAccessFailClosed(session)) {
+      throw new Error('跨机构访问尚未初始化，不能批量修改会话已读状态')
+    }
+  } else {
+    if (!params.conversationId?.trim() || !params.conversationType) {
+      throw new Error('会话已读写操作缺少会话身份')
+    }
+    assertConversationMutationAllowed(session, {
+      conversationType: params.conversationType,
+      peerOrganization: params.peerOrganization
+    })
+  }
   return requestWebApi<{ updated: number }>(config, '/saimulti/web/im/markRead', {
     method: 'POST',
     token: session.accessToken,
@@ -723,7 +865,10 @@ export async function markConversationRead(
 export function mapConversation(payload: ConversationPayload): ImConversation {
   const type = Number(payload.conversation_type ?? 1) === 2 ? 'group' : 'single'
   const peerUser = payload.peer_user ? mapWebImUser(payload.peer_user) : null
-  const title = String(payload.title || peerUser?.nickname || (type === 'group' ? '群聊' : '单聊'))
+  if (type === 'single' && !peerUser) {
+    throw new Error('单聊会话缺少 peer_user 复合身份')
+  }
+  const title = String(payload.title || peerUser?.displayName || (type === 'group' ? '群聊' : '单聊'))
   const lastMessageTime = String(payload.last_message_time ?? '')
   const sortTime = String(payload.sort_time || payload.last_message_time || '')
 
@@ -740,12 +885,14 @@ export function mapConversation(payload: ConversationPayload): ImConversation {
     avatarMembers: Array.isArray(payload.avatar_members)
       ? payload.avatar_members.map(mapAvatarMember)
       : [],
+    peerOrganization: peerUser?.organization ?? '',
     peerUserId: peerUser?.userId ?? '',
     peerUser,
     preview: normalizeConversationPreview(String(payload.last_message_summary ?? '')),
     time: formatConversationTime(lastMessageTime),
     lastMessageId: String(payload.last_message_id ?? ''),
     lastMessageSeq: Number(payload.last_message_seq ?? 0),
+    lastChangeSeq: Number(payload.last_change_seq ?? 0),
     lastMessageIndexId: Number(payload.last_message_index_id ?? 0),
     lastMessageTime,
     sortTime,
@@ -785,8 +932,10 @@ export function normalizeConversationPreview(value: string) {
 }
 
 export function createVirtualConversation(contact: Contact): ImConversation {
+  const identity = imIdentityKey(contact.organization, contact.userId)
+  if (!identity) throw new Error('联系人缺少有效复合身份')
   return {
-    id: `friend:${contact.userId}`,
+    id: `friend:${identity}`,
     conversationId: '',
     conversationSortId: 0,
     conversationType: 'single',
@@ -796,9 +945,15 @@ export function createVirtualConversation(contact: Contact): ImConversation {
     avatarExpiresAt: contact.avatarExpiresAt,
     description: '',
     avatarMembers: [],
+    peerOrganization: contact.organization,
     peerUserId: contact.userId,
     peerUser: {
       id: contact.id,
+      organization: contact.organization,
+      organizationName: contact.organizationName,
+      companyName: contact.companyName,
+      isCrossOrganization: contact.isCrossOrganization,
+      displayName: contact.name,
       userId: contact.userId,
       account: contact.account,
       nickname: contact.name,
@@ -821,6 +976,7 @@ export function createVirtualConversation(contact: Contact): ImConversation {
     time: '',
     lastMessageId: '',
     lastMessageSeq: 0,
+    lastChangeSeq: 0,
     lastMessageIndexId: 0,
     lastMessageTime: '',
     sortTime: '',
@@ -849,7 +1005,10 @@ export async function fetchContacts(
     query: { keyword }
   })
 
-  return data.map(mapContact)
+  const contacts = data.map(mapContact)
+  return isCrossOrgAccessFailClosed(session)
+    ? contacts.filter((contact) => contact.organization === session.organization)
+    : contacts
 }
 
 export async function searchUsers(
@@ -862,19 +1021,34 @@ export async function searchUsers(
     query: { keyword }
   })
 
-  return data.map(mapWebImUser)
+  const users = data.map(mapWebImUser)
+  return isCrossOrgAccessFailClosed(session)
+    ? users.filter((user) => user.organization === session.organization)
+    : users
 }
 
 export async function sendFriendRequest(
   config: TenantBrandConfig,
   session: WebImSession,
+  organization: string,
   userId: string,
   message: string
 ) {
+  const targetOrganization = normalizeImOrganization(organization)
+  if (!targetOrganization || !userId.trim()) {
+    throw new Error('好友申请缺少目标复合身份')
+  }
+  if (
+    isCrossOrgAccessFailClosed(session) &&
+    targetOrganization !== session.organization
+  ) {
+    throw new Error('跨机构访问尚未初始化，不能发送跨机构好友申请')
+  }
   return requestWebApi<{ status: string; message: string }>(config, '/saimulti/web/im/sendFriendRequest', {
     method: 'POST',
     token: session.accessToken,
     body: {
+      to_organization: Number(targetOrganization),
       to_user_id: userId,
       message
     }
@@ -889,19 +1063,43 @@ export async function fetchFriendRequests(
     token: session.accessToken
   })
 
-  return data.map(mapFriendRequest)
+  const requests = data.map(mapFriendRequest)
+  return isCrossOrgAccessFailClosed(session)
+    ? requests.filter((request) =>
+        request.fromOrganization === session.organization &&
+        request.toOrganization === session.organization
+      )
+    : requests
 }
 
 export async function handleFriendRequest(
   config: TenantBrandConfig,
   session: WebImSession,
-  id: number,
+  request: Pick<
+    FriendRequest,
+    'id' | 'fromOrganization' | 'toOrganization'
+  >,
   action: 'accept' | 'reject'
 ) {
+  const fromOrganization = normalizeImOrganization(request.fromOrganization)
+  const toOrganization = normalizeImOrganization(request.toOrganization)
+  if (!Number.isSafeInteger(request.id) || request.id <= 0 ||
+    !fromOrganization || !toOrganization) {
+    throw new Error('好友申请缺少权威复合机构身份')
+  }
+  if (
+    isCrossOrgAccessFailClosed(session) &&
+    (
+      fromOrganization !== session.organization ||
+      toOrganization !== session.organization
+    )
+  ) {
+    throw new Error('跨机构访问尚未初始化，不能处理跨机构好友申请')
+  }
   return requestWebApi<{ status: string }>(config, '/saimulti/web/im/handleFriendRequest', {
     method: 'POST',
     token: session.accessToken,
-    body: { id, action }
+    body: { id: request.id, action }
   })
 }
 
@@ -971,8 +1169,15 @@ function mapGroupMember(item: GroupMemberPayload): GroupMember {
 export async function updateConversationSetting(
   config: TenantBrandConfig,
   session: WebImSession,
-  payload: { conversationId: string; isPinned?: boolean; isMuted?: boolean }
+  payload: {
+    conversationId: string
+    conversationType: 'single' | 'group'
+    peerOrganization?: string
+    isPinned?: boolean
+    isMuted?: boolean
+  }
 ) {
+  assertConversationMutationAllowed(session, payload)
   return requestWebApi<{ conversation_id: string; is_pinned: boolean; is_muted: boolean }>(
     config,
     '/saimulti/web/im/updateConversationSetting',
@@ -1079,14 +1284,24 @@ export async function removeGroupMember(
 export async function updateFriendRemark(
   config: TenantBrandConfig,
   session: WebImSession,
+  friendOrganization: string,
   friendUserId: string,
   remark: string
 ) {
+  const targetOrganization = assertCrossOrgMutationAllowed(
+    session,
+    friendOrganization,
+    '好友备注写操作缺少好友机构身份',
+    '跨机构访问尚未初始化，不能修改跨机构好友备注'
+  )
+  const targetUserId = friendUserId.trim()
+  if (!targetUserId) throw new Error('好友备注写操作缺少好友用户身份')
   return requestWebApi<{ friend_user_id: string; remark: string }>(config, '/saimulti/web/im/updateFriendRemark', {
     method: 'POST',
     token: session.accessToken,
     body: {
-      friend_user_id: friendUserId,
+      friend_organization: Number(targetOrganization),
+      friend_user_id: targetUserId,
       remark
     }
   })
@@ -1211,7 +1426,12 @@ export async function resolveImAssetUrl(
   const conversationId = String(source.conversationId ?? '')
   const messageId = String(source.messageId ?? '')
   if (Boolean(conversationId) !== Boolean(messageId)) throw new Error('附件消息上下文不完整')
-  const cacheKey = `${session.organization}:${session.user.userId}:${source.fileId}`
+  const accessSnapshotId = currentConversationAccessSnapshot(
+    session.organization,
+    session.user.userId
+  )
+  const cacheKey =
+    `${session.organization}:${session.user.userId}:${accessSnapshotId}:${source.fileId}`
   const cached = privateAssetUrlCache.get(cacheKey)
   const now = Math.floor(Date.now() / 1000)
   if (!force && cached && cached.expiresAt > now + PRIVATE_ASSET_CACHE_SKEW_SECONDS) {

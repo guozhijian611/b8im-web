@@ -8,6 +8,8 @@
     "dev": "vite --host 127.0.0.1",
     "typecheck": "vue-tsc --noEmit",
     "test:realtime-dedup": "node --experimental-strip-types --test tests/realtimeEventDedup.test.ts",
+    "test:im-identity": "node --experimental-strip-types --test tests/imIdentity.test.ts",
+    "test": "node --experimental-strip-types --test tests/*.test.ts",
     "test:routing": "node --experimental-strip-types --test tests/routing.test.ts",
     "test:telemetry": "node --experimental-strip-types --test tests/telemetry.test.ts tests/apiTelemetry.test.ts tests/imTelemetry.test.ts",
     "test:web-device": "node --experimental-strip-types --test tests/webDevice.test.ts",

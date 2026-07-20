@@ -69,7 +69,12 @@ const hiddenMemberCount = computed(() => Math.max(members.value.length - visible
 const memberUserIdSet = computed(() => new Set(members.value.map((member) => member.user.userId)))
 const availableInviteContacts = computed(() => {
   const keyword = inviteKeyword.value.trim().toLowerCase()
-  const rows = contacts.value.filter((contact) => !memberUserIdSet.value.has(contact.userId) && !contact.isSystem)
+  const rows = contacts.value.filter(
+    (contact) =>
+      !memberUserIdSet.value.has(contact.userId) &&
+      !contact.isSystem &&
+      contact.organization === props.webSession.organization
+  )
   if (!keyword) return rows
   return rows.filter((contact) =>
     [contact.name, contact.account, contact.imShortNo, contact.remark]

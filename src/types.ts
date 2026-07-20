@@ -36,6 +36,11 @@ export type ImConnectionState = 'idle' | 'connecting' | 'connected' | 'offline' 
 
 export interface WebImUser {
   id: string
+  organization: string
+  organizationName: string
+  companyName: string
+  isCrossOrganization: boolean
+  displayName: string
   userId: string
   account: string
   nickname: string
@@ -57,6 +62,11 @@ export interface WebImUser {
 
 export interface ImMessageSender {
   id?: string | number
+  organization?: string | number
+  organization_name?: string
+  company_name?: string
+  is_cross_organization?: boolean | number
+  display_name?: string
   user_id?: string
   account?: string
   nickname?: string
@@ -83,6 +93,7 @@ export interface WebImSession {
   deploymentId: string
   apiServerUrl: string
   imServerUrl: string
+  crossOrgAccessSnapshotId: string
   user: WebImUser
 }
 
@@ -118,12 +129,14 @@ export interface ImConversation {
   avatarExpiresAt: number
   description: string
   avatarMembers: AvatarMember[]
+  peerOrganization: string
   peerUserId: string
   peerUser?: WebImUser | null
   preview: string
   time: string
   lastMessageId: string
   lastMessageSeq: number
+  lastChangeSeq: number
   lastMessageIndexId: number
   lastMessageTime: string
   sortTime: string
@@ -151,13 +164,17 @@ export interface MessageGroup {
 
 export interface ImPacketMessage {
   id: number
+  organization: string | number
+  global_seq?: string | number
   conversation_id: string
   conversation_type: number
   message_id: string
   message_seq: number
   client_msg_id: string
+  sender_organization: string | number
   sender_id: string
   sender_user?: ImMessageSender | null
+  delivery_status?: 'sent' | 'delivered' | 'read'
   message_type: number
   content: Record<string, unknown>
   status: number
@@ -207,6 +224,8 @@ export interface FriendRequest {
   statusText: string
   createTime: string
   handleTime: string
+  fromOrganization: string
+  toOrganization: string
   fromUser: WebImUser | null
   toUser: WebImUser | null
 }
@@ -244,6 +263,7 @@ export interface Message {
   editCount?: number
   meta?: string
   senderUserId?: string
+  senderOrganization?: string
   quote?: MessageQuote | null
   forwardBundle?: MessageForwardBundle | null
   mentions?: MessageMention[]
@@ -251,6 +271,10 @@ export interface Message {
 
 export interface Contact {
   id: string
+  organization: string
+  organizationName: string
+  companyName: string
+  isCrossOrganization: boolean
   userId: string
   account: string
   name: string
