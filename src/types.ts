@@ -123,6 +123,8 @@ export interface ImConversation {
   conversationId: string
   conversationSortId: number
   conversationType: 'single' | 'group'
+  groupAccessState?: 'active' | 'history_only'
+  groupAccessBlocked?: boolean
   title: string
   avatar: string
   avatarFileId: string

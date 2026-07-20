@@ -27,6 +27,7 @@ export interface WebApiOptions {
   guestToken?: string
   query?: Record<string, string | number | undefined>
   traceContext?: TraceContext
+  signal?: AbortSignal
 }
 
 export interface WebApiUploadOptions {
@@ -35,6 +36,7 @@ export interface WebApiUploadOptions {
   query?: WebApiOptions['query']
   onProgress?: (progress: number) => void
   traceContext?: TraceContext
+  signal?: AbortSignal
 }
 
 export class WebApiError extends Error {
@@ -158,6 +160,7 @@ export async function requestWebApi<T>(
   const attempts = safeToRetry ? config.serverInfo.routes.length : 1
   let lastNetworkError: unknown
   for (let attempt = 0; attempt < Math.max(1, attempts); attempt += 1) {
+    if (options.signal?.aborted) throw new DOMException('请求已取消', 'AbortError')
     const candidate = activeServiceCandidate(config, 'api')
     const attemptSpan = tryStartTelemetrySpan({
       name: 'web.http.attempt',
@@ -173,7 +176,13 @@ export async function requestWebApi<T>(
     })
     if (attemptSpan) injectTraceHeaders(headers, attemptSpan.context)
     const controller = new AbortController()
-    const timeout = window.setTimeout(() => controller.abort(), API_TIMEOUT_MS)
+    let timedOut = false
+    const abortFromCaller = () => controller.abort(options.signal?.reason)
+    options.signal?.addEventListener('abort', abortFromCaller, { once: true })
+    const timeout = window.setTimeout(() => {
+      timedOut = true
+      controller.abort()
+    }, API_TIMEOUT_MS)
     init.signal = controller.signal
     let response: Response
     try {
@@ -186,13 +195,14 @@ export async function requestWebApi<T>(
         type: aborted ? 'timeout' : 'network_error',
         retryCount: attempt
       })
+      if (options.signal?.aborted) throw error
       if (!safeToRetry || attempt + 1 >= attempts) {
         requestSpan?.fail({
           code: aborted ? 'HTTP_TIMEOUT' : 'HTTP_NETWORK_ERROR',
           type: aborted ? 'timeout' : 'network_error',
           retryCount: attempt
         })
-        if (aborted) throw new WebApiError('请求超时，请检查目标服务', 0)
+        if (aborted && timedOut) throw new WebApiError('请求超时，请检查目标服务', 0)
         throw error
       }
       const next = promoteServiceCandidate(config, 'api', candidate.routeId)
@@ -203,6 +213,7 @@ export async function requestWebApi<T>(
       continue
     } finally {
       window.clearTimeout(timeout)
+      options.signal?.removeEventListener('abort', abortFromCaller)
     }
     if (safeToRetry && [502, 503, 504].includes(response.status) && attempt + 1 < attempts) {
       attemptSpan?.fail({
@@ -269,6 +280,10 @@ export function requestWebApiWithUpload<T>(
   options: WebApiUploadOptions
 ): Promise<T> {
   return new Promise((resolve, reject) => {
+    if (options.signal?.aborted) {
+      reject(new DOMException('请求已取消', 'AbortError'))
+      return
+    }
     const accessEpoch = requestAccessEpoch(config, options.token)
     const uploadSpan = tryStartTelemetrySpan({
       name: 'web.http.upload',
@@ -281,6 +296,15 @@ export function requestWebApiWithUpload<T>(
       }
     })
     const xhr = new XMLHttpRequest()
+    let settled = false
+    const finish = (action: () => void) => {
+      if (settled) return
+      settled = true
+      options.signal?.removeEventListener('abort', abortFromCaller)
+      action()
+    }
+    const abortFromCaller = () => xhr.abort()
+    options.signal?.addEventListener('abort', abortFromCaller, { once: true })
     xhr.open('POST', createWebApiUrl(config, path, options.query), true)
     xhr.withCredentials = false
     xhr.timeout = API_TIMEOUT_MS
@@ -301,11 +325,15 @@ export function requestWebApiWithUpload<T>(
     }
     xhr.onerror = () => {
       uploadSpan?.fail({ code: 'HTTP_UPLOAD_NETWORK_ERROR', type: 'network_error' }, { statusCode: xhr.status })
-      reject(new WebApiError('上传失败，请检查网络后重试', xhr.status))
+      finish(() => reject(new WebApiError('上传失败，请检查网络后重试', xhr.status)))
     }
     xhr.ontimeout = () => {
       uploadSpan?.fail({ code: 'HTTP_UPLOAD_TIMEOUT', type: 'timeout' }, { statusCode: xhr.status })
-      reject(new WebApiError('上传超时，请检查目标服务', xhr.status))
+      finish(() => reject(new WebApiError('上传超时，请检查目标服务', xhr.status)))
+    }
+    xhr.onabort = () => {
+      uploadSpan?.fail({ code: 'HTTP_UPLOAD_ABORTED', type: 'authorization_changed' }, { statusCode: xhr.status })
+      finish(() => reject(new DOMException('请求已取消', 'AbortError')))
     }
     xhr.onload = () => {
       let payload: ApiResponse<T> = {}
@@ -319,7 +347,7 @@ export function requestWebApiWithUpload<T>(
           code: Number.isSafeInteger(payload.code) ? `API_${payload.code}` : 'HTTP_UPLOAD_RESPONSE_ERROR',
           type: 'api_error'
         }, { statusCode: xhr.status })
-        reject(new WebApiError(payload.message || `请求失败：${xhr.status}`, xhr.status, payload.code))
+        finish(() => reject(new WebApiError(payload.message || `请求失败：${xhr.status}`, xhr.status, payload.code)))
         return
       }
       if (accessEpoch && !isConversationAccessEpochCurrent(accessEpoch)) {
@@ -327,11 +355,11 @@ export function requestWebApiWithUpload<T>(
           code: 'HTTP_ACCESS_EPOCH_CHANGED',
           type: 'authorization_changed'
         }, { statusCode: xhr.status })
-        reject(new ConversationAccessEpochChangedError())
+        finish(() => reject(new ConversationAccessEpochChangedError()))
         return
       }
       uploadSpan?.end({ statusCode: xhr.status })
-      resolve(payload.data as T)
+      finish(() => resolve(payload.data as T))
     }
     xhr.send(options.body)
   })

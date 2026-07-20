@@ -17,6 +17,16 @@ import type { TraceContext } from './telemetry.ts'
 import { getWebDeviceId } from './webDevice.ts'
 import { imIdentityKey, normalizeImOrganization } from './imIdentity.ts'
 import {
+  assertActiveGroupAccess,
+  assertGroupAccessEpochCurrent,
+  captureGroupAccessEpoch,
+  currentGroupAccessEntry,
+  isGroupMessageBatchVisible,
+  isGroupMessageVisible,
+  startGroupAccessTask,
+  type GroupAccessTask
+} from './groupMemberAccess.ts'
+import {
   currentConversationAccessSnapshot,
   isAccessSnapshotFailClosed,
   isConversationAccessRecoveryRequired,
@@ -767,7 +777,10 @@ export async function updateConversationGroup(
   }
 ) {
   assertConversationMutationAllowed(session, payload)
-  return requestWebApi<{ conversation_id: string; message_group_id: number; message_group_name: string }>(
+  const groupAccessEpoch = payload.conversationType === 'group'
+    ? (assertActiveGroupAccess(session, payload.conversationId), captureGroupAccessEpoch(session))
+    : null
+  const result = await requestWebApi<{ conversation_id: string; message_group_id: number; message_group_name: string }>(
     config,
     '/saimulti/web/im/updateConversationGroup',
     {
@@ -779,6 +792,8 @@ export async function updateConversationGroup(
       }
     }
   )
+  if (groupAccessEpoch) assertGroupAccessEpochCurrent(groupAccessEpoch)
+  return result
 }
 
 export async function fetchMessageConfig(
@@ -800,6 +815,7 @@ export async function fetchMessages(
   session: WebImSession,
   params: {
     conversationId?: string
+    conversationType?: 'single' | 'group'
     peerOrganization?: string
     peerUserId?: string
     afterSeq?: number
@@ -807,7 +823,16 @@ export async function fetchMessages(
     limit?: number
   }
 ) {
-  return requestWebApi<{
+  const groupAccessEpoch = params.conversationType === 'group'
+    ? captureGroupAccessEpoch(session)
+    : null
+  const groupEntry = params.conversationType === 'group'
+    ? currentGroupAccessEntry(session, params.conversationId)
+    : null
+  if (params.conversationType === 'group' && !groupEntry) {
+    throw new Error('当前群成员访问不允许读取消息')
+  }
+  const result = await requestWebApi<{
     messages: ImPacketMessage[]
     next_after_seq: number
     next_before_seq: number
@@ -827,6 +852,13 @@ export async function fetchMessages(
       }
     }
   )
+  if (groupAccessEpoch) {
+    assertGroupAccessEpochCurrent(groupAccessEpoch)
+    if (!isGroupMessageBatchVisible(groupEntry, params.conversationId, result.messages)) {
+      throw new Error('群消息历史超出成员可见周期')
+    }
+  }
+  return result
 }
 
 export async function markConversationRead(
@@ -839,10 +871,12 @@ export async function markConversationRead(
     peerOrganization?: string
   }
 ) {
+  let groupAccessEpoch = null as ReturnType<typeof captureGroupAccessEpoch> | null
   if (params.all) {
     if (isCrossOrgAccessFailClosed(session)) {
       throw new Error('跨机构访问尚未初始化，不能批量修改会话已读状态')
     }
+    groupAccessEpoch = captureGroupAccessEpoch(session)
   } else {
     if (!params.conversationId?.trim() || !params.conversationType) {
       throw new Error('会话已读写操作缺少会话身份')
@@ -851,8 +885,12 @@ export async function markConversationRead(
       conversationType: params.conversationType,
       peerOrganization: params.peerOrganization
     })
+    if (params.conversationType === 'group') {
+      assertActiveGroupAccess(session, params.conversationId)
+      groupAccessEpoch = captureGroupAccessEpoch(session)
+    }
   }
-  return requestWebApi<{ updated: number }>(config, '/saimulti/web/im/markRead', {
+  const result = await requestWebApi<{ updated: number }>(config, '/saimulti/web/im/markRead', {
     method: 'POST',
     token: session.accessToken,
     body: {
@@ -860,6 +898,8 @@ export async function markConversationRead(
       all: params.all ?? false
     }
   })
+  if (groupAccessEpoch) assertGroupAccessEpochCurrent(groupAccessEpoch)
+  return result
 }
 
 export function mapConversation(payload: ConversationPayload): ImConversation {
@@ -1125,10 +1165,13 @@ export async function fetchGroupMembers(
   session: WebImSession,
   conversationId: string
 ): Promise<GroupMember[]> {
+  assertActiveGroupAccess(session, conversationId)
+  const groupAccessEpoch = captureGroupAccessEpoch(session)
   const data = await requestWebApi<GroupMemberPayload[]>(config, '/saimulti/web/im/groupMembers', {
     token: session.accessToken,
     query: { conversation_id: conversationId }
   })
+  assertGroupAccessEpochCurrent(groupAccessEpoch)
 
   return data.map((item) => ({
     user: mapWebImUser(item.user),
@@ -1144,6 +1187,8 @@ export async function addGroupMembers(
   session: WebImSession,
   payload: { conversationId: string; memberIds: string[] }
 ): Promise<GroupMember[]> {
+  assertActiveGroupAccess(session, payload.conversationId)
+  const groupAccessEpoch = captureGroupAccessEpoch(session)
   const data = await requestWebApi<GroupMemberPayload[]>(config, '/saimulti/web/im/addGroupMembers', {
     method: 'POST',
     token: session.accessToken,
@@ -1152,6 +1197,7 @@ export async function addGroupMembers(
       member_ids: payload.memberIds
     }
   })
+  assertGroupAccessEpochCurrent(groupAccessEpoch)
 
   return data.map(mapGroupMember)
 }
@@ -1178,7 +1224,10 @@ export async function updateConversationSetting(
   }
 ) {
   assertConversationMutationAllowed(session, payload)
-  return requestWebApi<{ conversation_id: string; is_pinned: boolean; is_muted: boolean }>(
+  const groupAccessEpoch = payload.conversationType === 'group'
+    ? (assertActiveGroupAccess(session, payload.conversationId), captureGroupAccessEpoch(session))
+    : null
+  const result = await requestWebApi<{ conversation_id: string; is_pinned: boolean; is_muted: boolean }>(
     config,
     '/saimulti/web/im/updateConversationSetting',
     {
@@ -1191,6 +1240,8 @@ export async function updateConversationSetting(
       }
     }
   )
+  if (groupAccessEpoch) assertGroupAccessEpochCurrent(groupAccessEpoch)
+  return result
 }
 
 export async function updateGroupProfile(
@@ -1204,6 +1255,8 @@ export async function updateGroupProfile(
     notifyAll?: boolean
   }
 ): Promise<{ conversation: ImConversation; noticeMessage: ImPacketMessage | null }> {
+  assertActiveGroupAccess(session, payload.conversationId)
+  const groupAccessEpoch = captureGroupAccessEpoch(session)
   const data = await requestWebApi<UpdateGroupProfilePayload>(config, '/saimulti/web/im/updateGroupProfile', {
     method: 'POST',
     token: session.accessToken,
@@ -1215,6 +1268,7 @@ export async function updateGroupProfile(
       notify_all: payload.notifyAll ?? false
     }
   })
+  assertGroupAccessEpochCurrent(groupAccessEpoch)
 
   return {
     conversation: mapConversation(data),
@@ -1227,6 +1281,8 @@ export async function updateGroupManagers(
   session: WebImSession,
   payload: { conversationId: string; managerUserIds: string[] }
 ): Promise<GroupMember[]> {
+  assertActiveGroupAccess(session, payload.conversationId)
+  const groupAccessEpoch = captureGroupAccessEpoch(session)
   const data = await requestWebApi<GroupMemberPayload[]>(config, '/saimulti/web/im/updateGroupManagers', {
     method: 'POST',
     token: session.accessToken,
@@ -1235,6 +1291,7 @@ export async function updateGroupManagers(
       manager_user_ids: payload.managerUserIds
     }
   })
+  assertGroupAccessEpochCurrent(groupAccessEpoch)
 
   return data.map((item) => ({
     user: mapWebImUser(item.user),
@@ -1250,6 +1307,8 @@ export async function updateGroupMemberStatus(
   session: WebImSession,
   payload: { conversationId: string; memberUserId: string; status: number; muteUntil?: string }
 ): Promise<GroupMember[]> {
+  assertActiveGroupAccess(session, payload.conversationId)
+  const groupAccessEpoch = captureGroupAccessEpoch(session)
   const data = await requestWebApi<GroupMemberPayload[]>(config, '/saimulti/web/im/updateGroupMemberStatus', {
     method: 'POST',
     token: session.accessToken,
@@ -1260,6 +1319,7 @@ export async function updateGroupMemberStatus(
       mute_until: payload.muteUntil ?? ''
     }
   })
+  assertGroupAccessEpochCurrent(groupAccessEpoch)
 
   return data.map(mapGroupMember)
 }
@@ -1269,6 +1329,8 @@ export async function removeGroupMember(
   session: WebImSession,
   payload: { conversationId: string; memberUserId: string }
 ): Promise<GroupMember[]> {
+  assertActiveGroupAccess(session, payload.conversationId)
+  const groupAccessEpoch = captureGroupAccessEpoch(session)
   const data = await requestWebApi<GroupMemberPayload[]>(config, '/saimulti/web/im/removeGroupMember', {
     method: 'POST',
     token: session.accessToken,
@@ -1277,6 +1339,7 @@ export async function removeGroupMember(
       member_user_id: payload.memberUserId
     }
   })
+  assertGroupAccessEpochCurrent(groupAccessEpoch)
 
   return data.map(mapGroupMember)
 }
@@ -1310,9 +1373,24 @@ export async function updateFriendRemark(
 export async function searchConversationMessages(
   config: TenantBrandConfig,
   session: WebImSession,
-  params: { conversationId: string; keyword: string; messageType?: number; limit?: number }
+  params: {
+    conversationId: string
+    conversationType: 'single' | 'group'
+    keyword: string
+    messageType?: number
+    limit?: number
+  }
 ) {
-  return requestWebApi<ImPacketMessage[]>(config, '/saimulti/web/im/searchMessages', {
+  const groupAccessEpoch = params.conversationType === 'group'
+    ? captureGroupAccessEpoch(session)
+    : null
+  const groupEntry = params.conversationType === 'group'
+    ? currentGroupAccessEntry(session, params.conversationId)
+    : null
+  if (params.conversationType === 'group' && !groupEntry) {
+    throw new Error('当前群成员访问不允许搜索消息')
+  }
+  const result = await requestWebApi<ImPacketMessage[]>(config, '/saimulti/web/im/searchMessages', {
     token: session.accessToken,
     query: {
       conversation_id: params.conversationId,
@@ -1321,6 +1399,13 @@ export async function searchConversationMessages(
       limit: params.limit ?? 50
     }
   })
+  if (groupAccessEpoch) {
+    assertGroupAccessEpochCurrent(groupAccessEpoch)
+    if (!isGroupMessageBatchVisible(groupEntry, params.conversationId, result)) {
+      throw new Error('群消息搜索结果超出成员可见周期')
+    }
+  }
+  return result
 }
 
 export async function uploadImAsset(
@@ -1328,31 +1413,45 @@ export async function uploadImAsset(
   session: WebImSession,
   file: File,
   kind: UploadedAsset['kind'],
-  options: { conversationType?: 'single' | 'group'; onProgress?: UploadProgressHandler } = {}
+  options: {
+    conversationType?: 'single' | 'group'
+    conversationId?: string
+    onProgress?: UploadProgressHandler
+  } = {}
 ): Promise<UploadedAsset> {
-  options.onProgress?.(3)
-  const prepared = await requestWebApi<PrepareUploadPayload>(config, '/saimulti/web/im/prepareUpload', {
-    method: 'POST',
-    token: session.accessToken,
-    body: {
-      kind,
-      filename: file.name,
-      size: file.size,
-      mime_type: file.type,
-      conversation_type: options.conversationType
+  const groupTask = options.conversationType === 'group'
+    ? startGroupAccessTask(session, options.conversationId, true)
+    : null
+  try {
+    options.onProgress?.(3)
+    const prepared = await requestWebApi<PrepareUploadPayload>(config, '/saimulti/web/im/prepareUpload', {
+      method: 'POST',
+      token: session.accessToken,
+      signal: groupTask?.signal,
+      body: {
+        kind,
+        filename: file.name,
+        size: file.size,
+        mime_type: file.type,
+        conversation_type: options.conversationType
+      }
+    })
+    groupTask?.assertCurrent()
+    options.onProgress?.(8)
+
+    if (
+      prepared.mode === 'proxy' &&
+      prepared.method === 'POST' &&
+      prepared.upload_path === '/saimulti/web/im/upload'
+    ) {
+      return await uploadImAssetByProxy(
+        config, session, file, kind, options.onProgress, groupTask
+      )
     }
-  })
-  options.onProgress?.(8)
-
-  if (
-    prepared.mode === 'proxy' &&
-    prepared.method === 'POST' &&
-    prepared.upload_path === '/saimulti/web/im/upload'
-  ) {
-    return uploadImAssetByProxy(config, session, file, kind, options.onProgress)
+    throw new Error('上传模式无效')
+  } finally {
+    groupTask?.finish()
   }
-
-  throw new Error('上传模式无效')
 }
 
 async function uploadImAssetByProxy(
@@ -1360,7 +1459,8 @@ async function uploadImAssetByProxy(
   session: WebImSession,
   file: File,
   kind: UploadedAsset['kind'],
-  onProgress?: UploadProgressHandler
+  onProgress?: UploadProgressHandler,
+  groupTask: GroupAccessTask | null = null
 ): Promise<UploadedAsset> {
   const form = new FormData()
   form.set('file', file)
@@ -1368,15 +1468,14 @@ async function uploadImAssetByProxy(
   const data = await requestWebApiWithUpload<UploadedAssetPayload>(config, '/saimulti/web/im/upload', {
     token: session.accessToken,
     body: form,
-    onProgress
+    onProgress,
+    signal: groupTask?.signal
   })
 
+  groupTask?.assertCurrent()
   onProgress?.(100)
   const asset = mapUploadedAsset(data, file)
-  return {
-    ...asset,
-    url: await resolveImAssetUrl(config, session, { fileId: asset.fileId })
-  }
+  return asset
 }
 
 export async function deriveForwardAsset(
@@ -1387,28 +1486,40 @@ export async function deriveForwardAsset(
     messageId: string
     fileId: string
     kind: UploadedAsset['kind']
+    conversationType?: 'single' | 'group'
+    messageSeq?: number
   }
 ): Promise<UploadedAsset> {
-  const data = await requestWebApi<UploadedAssetPayload>(config, '/saimulti/web/im/deriveForwardAsset', {
-    method: 'POST',
-    token: session.accessToken,
-    body: {
-      conversation_id: source.conversationId,
-      message_id: source.messageId,
-      file_id: source.fileId,
-      kind: source.kind
-    }
-  })
-  const asset = mapUploadedAsset(data, {
-    name: '',
-    size: 0,
-    type: ''
-  })
-  if (asset.kind !== source.kind) throw new Error('派生附件类型与原消息不一致')
-
-  return {
-    ...asset,
-    url: await resolveImAssetUrl(config, session, { fileId: asset.fileId })
+  const groupTask = source.conversationType === 'group'
+    ? startGroupAccessTask(session, source.conversationId, true)
+    : null
+  try {
+    if (source.conversationType === 'group' && !isGroupMessageVisible(
+      currentGroupAccessEntry(session, source.conversationId),
+      source.conversationId,
+      { conversation_id: source.conversationId, message_seq: source.messageSeq }
+    )) throw new Error('原附件消息超出群成员可见周期')
+    const data = await requestWebApi<UploadedAssetPayload>(config, '/saimulti/web/im/deriveForwardAsset', {
+      method: 'POST',
+      token: session.accessToken,
+      signal: groupTask?.signal,
+      body: {
+        conversation_id: source.conversationId,
+        message_id: source.messageId,
+        file_id: source.fileId,
+        kind: source.kind
+      }
+    })
+    groupTask?.assertCurrent()
+    const asset = mapUploadedAsset(data, {
+      name: '',
+      size: 0,
+      type: ''
+    })
+    if (asset.kind !== source.kind) throw new Error('派生附件类型与原消息不一致')
+    return asset
+  } finally {
+    groupTask?.finish()
   }
 }
 
@@ -1419,6 +1530,8 @@ export async function resolveImAssetUrl(
     fileId: string
     conversationId?: string
     messageId?: string
+    conversationType?: 'single' | 'group'
+    messageSeq?: number
   },
   force = false
 ): Promise<string> {
@@ -1426,38 +1539,56 @@ export async function resolveImAssetUrl(
   const conversationId = String(source.conversationId ?? '')
   const messageId = String(source.messageId ?? '')
   if (Boolean(conversationId) !== Boolean(messageId)) throw new Error('附件消息上下文不完整')
+  const groupTask = source.conversationType === 'group'
+    ? startGroupAccessTask(session, conversationId, false)
+    : null
+  if (source.conversationType === 'group' && !isGroupMessageVisible(
+    currentGroupAccessEntry(session, conversationId),
+    conversationId,
+    { conversation_id: conversationId, message_seq: source.messageSeq }
+  )) {
+    groupTask?.finish()
+    throw new Error('附件消息超出群成员可见周期')
+  }
   const accessSnapshotId = currentConversationAccessSnapshot(
     session.organization,
     session.user.userId
   )
-  const cacheKey =
-    `${session.organization}:${session.user.userId}:${accessSnapshotId}:${source.fileId}`
-  const cached = privateAssetUrlCache.get(cacheKey)
-  const now = Math.floor(Date.now() / 1000)
-  if (!force && cached && cached.expiresAt > now + PRIVATE_ASSET_CACHE_SKEW_SECONDS) {
-    return cached.url
-  }
-
-  const data = await requestWebApi<AssetUrlPayload>(config, '/saimulti/web/im/resolveAssetUrl', {
-    method: 'POST',
-    token: session.accessToken,
-    body: {
-      file_id: source.fileId,
-      ...(conversationId ? { conversation_id: conversationId, message_id: messageId } : {})
+  const cacheKey = `${session.organization}:${session.user.userId}:${accessSnapshotId}:` +
+    `${encodeURIComponent(groupTask?.cacheEpoch ?? 'other')}:` +
+    `${encodeURIComponent(conversationId)}:${encodeURIComponent(messageId)}:${source.fileId}`
+  try {
+    const cached = privateAssetUrlCache.get(cacheKey)
+    const now = Math.floor(Date.now() / 1000)
+    if (!force && cached && cached.expiresAt > now + PRIVATE_ASSET_CACHE_SKEW_SECONDS) {
+      groupTask?.assertCurrent()
+      return cached.url
     }
-  })
-  const expiresAt = Number(data.expires_at ?? 0)
-  if (
-    data.file_id !== source.fileId ||
-    !Number.isSafeInteger(expiresAt) ||
-    expiresAt <= now + PRIVATE_ASSET_CACHE_SKEW_SECONDS
-  ) {
-    throw new Error('附件临时访问凭证无效')
+    const data = await requestWebApi<AssetUrlPayload>(config, '/saimulti/web/im/resolveAssetUrl', {
+      method: 'POST',
+      token: session.accessToken,
+      signal: groupTask?.signal,
+      body: {
+        file_id: source.fileId,
+        ...(conversationId ? { conversation_id: conversationId, message_id: messageId } : {})
+      }
+    })
+    groupTask?.assertCurrent()
+    const expiresAt = Number(data.expires_at ?? 0)
+    if (
+      data.file_id !== source.fileId ||
+      !Number.isSafeInteger(expiresAt) ||
+      expiresAt <= now + PRIVATE_ASSET_CACHE_SKEW_SECONDS
+    ) {
+      throw new Error('附件临时访问凭证无效')
+    }
+    const url = assertResourceUrl(String(data.url ?? ''))
+    groupTask?.assertCurrent()
+    privateAssetUrlCache.set(cacheKey, { url, expiresAt })
+    return url
+  } finally {
+    groupTask?.finish()
   }
-  const url = assertResourceUrl(String(data.url ?? ''))
-  privateAssetUrlCache.set(cacheKey, { url, expiresAt })
-
-  return url
 }
 
 function mapUploadedAsset(
@@ -1502,12 +1633,16 @@ export function loadWebSession(config: TenantBrandConfig): WebImSession | null {
   }
 }
 
-export function clearWebSession(_session?: WebImSession | null) {
-  if (_session) {
-    const prefix = `${_session.organization}:${_session.user.userId}:`
+export function clearPrivateAssetUrlCache(session?: WebImSession | null) {
+  if (session) {
+    const prefix = `${session.organization}:${session.user.userId}:`
     for (const key of privateAssetUrlCache.keys()) {
       if (key.startsWith(prefix)) privateAssetUrlCache.delete(key)
     }
   }
+}
+
+export function clearWebSession(session?: WebImSession | null) {
+  clearPrivateAssetUrlCache(session)
   window.sessionStorage.removeItem(WINDOW_STORAGE_KEY)
 }

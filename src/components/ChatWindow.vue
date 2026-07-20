@@ -22,6 +22,7 @@ import {
 } from '@lucide/vue'
 import ConversationAvatar from './ConversationAvatar.vue'
 import { CONTEXT_MENU_CLOSE_EVENT, emitCloseContextMenus, isCloseFromSource } from '../services/contextMenu'
+import { GROUP_ACCESS_BROWSER_EVENT } from '../services/groupMemberAccess'
 import { layer } from '../services/layer'
 import type { GroupMember, ImConnectionState, ImConversation, Message, MessageForwardBundle, MessageForwardItem, MessageGroup, MessageMention } from '../types'
 
@@ -209,7 +210,10 @@ const onlineText = computed(() => {
   return 'IM 离线'
 })
 
-const canSend = computed(() => Boolean(props.conversation) && props.connectionState === 'connected')
+const canSend = computed(() => Boolean(props.conversation) &&
+  props.conversation?.groupAccessBlocked !== true &&
+  props.conversation?.groupAccessState !== 'history_only' &&
+  props.connectionState === 'connected')
 const activeMenuMessage = computed(() => messageMenu.value.message)
 const canCopyMenuMessage = computed(() => Boolean(activeMenuMessage.value?.content.trim()))
 const canOpenMenuMessage = computed(() => Boolean(activeMenuMessage.value?.url))
@@ -262,9 +266,11 @@ const activeForwardBundle = computed(() => {
 })
 const canBackForwardPreview = computed(() => forwardPreviewStack.value.length > 1)
 const isEditing = computed(() => Boolean(editingMessage.value))
-const canMentionMembers = computed(() => props.conversation?.conversationType === 'group' && !isEditing.value)
+const canMentionMembers = computed(() => props.conversation?.conversationType === 'group' &&
+  props.conversation.groupAccessState !== 'history_only' && !isEditing.value)
 const composerPlaceholder = computed(() => {
   if (!props.conversation) return '先选择一个会话'
+  if (props.conversation.groupAccessState === 'history_only') return '当前群仅可查看授权历史'
   if (isEditing.value) return '编辑消息'
   if (replyMessage.value) return `回复 ${replyMessage.value.sender}`
   return canSend.value ? '发送消息' : 'IM 连接后可发送'
@@ -1201,6 +1207,9 @@ async function onMessageStreamScroll() {
 watch(
   () => props.conversation?.id,
   (conversationId) => {
+    // Drafts are runtime-only and must never cross a conversation identity;
+    // revocation removes the active identity through this same path.
+    draft.value = ''
     shouldScrollActiveConversationToBottom = Boolean(conversationId)
     if (editingMessage.value) {
       clearEditingState()
@@ -1223,6 +1232,26 @@ watch(
     }
   }
 )
+
+function clearGroupAccessDerivedState() {
+  draft.value = ''
+  clearPendingPaste()
+  clearEditingState()
+  clearReplyState()
+  exitSelectionMode()
+  closeForwardDialog()
+  closeForwardPreview()
+  closeMentionPanel()
+  closeMessageMenu()
+  mediaPreview.value = { visible: false, type: 'image', url: '', title: '' }
+  showSearch.value = false
+  searchKeyword.value = ''
+  searchResults.value = []
+  mentionMembers.value = []
+  selectedMentions.value = []
+  voiceAudioElements.forEach((audio) => audio.pause())
+  voicePlayback.value = {}
+}
 
 watch(() => props.openSearchToken, (token) => {
   if (token > 0) {
@@ -1266,6 +1295,7 @@ onMounted(() => {
   resizeComposerInput()
   window.addEventListener(CONTEXT_MENU_CLOSE_EVENT, handleContextMenuClose)
   window.addEventListener('keydown', handleWindowKeydown)
+  window.addEventListener(GROUP_ACCESS_BROWSER_EVENT, clearGroupAccessDerivedState)
   if (props.conversation && props.messages.length > 0) {
     scrollMessagesToBottomAfterRender()
   }
@@ -1274,6 +1304,7 @@ onMounted(() => {
 onBeforeUnmount(() => {
   window.removeEventListener(CONTEXT_MENU_CLOSE_EVENT, handleContextMenuClose)
   window.removeEventListener('keydown', handleWindowKeydown)
+  window.removeEventListener(GROUP_ACCESS_BROWSER_EVENT, clearGroupAccessDerivedState)
   voiceAudioElements.forEach((audio) => audio.pause())
   voiceAudioElements.clear()
   clearPendingPaste()

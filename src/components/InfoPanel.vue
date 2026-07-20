@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { Ban, BellOff, Camera, Check, ChevronRight, Crown, FileText, Megaphone, MoreHorizontal, Pencil, Plus, RotateCcw, Search, ShieldCheck, Star, UserMinus, UsersRound, X } from '@lucide/vue'
 import AvatarCropDialog from './AvatarCropDialog.vue'
 import ConversationAvatar from './ConversationAvatar.vue'
@@ -7,6 +7,7 @@ import { layer } from '../services/layer'
 import { addGroupMembers, fetchContacts, fetchGroupMembers, removeGroupMember, updateGroupManagers, updateGroupMemberStatus } from '../services/webIm'
 import type { TenantBrandConfig } from '../services/tenantConfig'
 import type { AvatarMember, Contact, GroupMember, ImConversation, WebImSession } from '../types'
+import { GROUP_ACCESS_BROWSER_EVENT } from '../services/groupMemberAccess'
 
 const props = defineProps<{
   conversation: ImConversation | null
@@ -93,6 +94,23 @@ async function loadMembers() {
   } catch {
     members.value = []
   }
+}
+
+function clearGroupAccessDerivedState() {
+  members.value = []
+  contacts.value = []
+  selectedInviteUserIds.value = []
+  selectedMember.value = null
+  groupTitleDraft.value = ''
+  groupDescriptionDraft.value = ''
+  groupDescriptionPublished.value = ''
+  groupDescriptionConfirm.value = false
+  showGroupAvatarCrop.value = false
+  showInviteDialog.value = false
+  inviteKeyword.value = ''
+  showMuteDialog.value = false
+  muteUntilDraft.value = ''
+  cancelGroupTitleEdit()
 }
 
 function syncGroupDescription() {
@@ -316,8 +334,12 @@ async function removeSelectedMember() {
 }
 
 onMounted(() => {
+  window.addEventListener(GROUP_ACCESS_BROWSER_EVENT, clearGroupAccessDerivedState)
   syncGroupDescription()
   void loadMembers()
+})
+onBeforeUnmount(() => {
+  window.removeEventListener(GROUP_ACCESS_BROWSER_EVENT, clearGroupAccessDerivedState)
 })
 watch(() => props.conversation?.conversationId, () => {
   cancelGroupTitleEdit()

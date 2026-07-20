@@ -69,31 +69,36 @@ test('global sync page requires ordered home-scoped messages and a progressing c
     messages: [message('6'), message('8')],
     next_after_global_seq: '9',
     has_more: true,
-    cross_org_access_snapshot_id: '42'
-  }, { organization: '901', afterGlobalSeq: '5' })
+    cross_org_access_snapshot_id: '42', access_snapshot_id: '7'
+  }, { organization: '901', afterGlobalSeq: '5', groupAccessSnapshotId: '7' })
   assert.ok(valid)
   assert.equal(valid.nextAfterGlobalSeq, '9')
   assert.equal(valid.messages.length, 2)
+  assert.equal(valid.groupAccessSnapshotId, '7')
+  assert.equal(validateGlobalSyncPage({
+    scope: 'global', messages: [], next_after_global_seq: '5',
+    has_more: false, cross_org_access_snapshot_id: '42', access_snapshot_id: '8'
+  }, { organization: '901', afterGlobalSeq: '5', groupAccessSnapshotId: '7' }), null)
 
   assert.equal(validateGlobalSyncPage({
     scope: 'global', messages: [], next_after_global_seq: '5',
-    has_more: true, cross_org_access_snapshot_id: '42'
-  }, { organization: '901', afterGlobalSeq: '5' }), null)
+    has_more: true, cross_org_access_snapshot_id: '42', access_snapshot_id: '7'
+  }, { organization: '901', afterGlobalSeq: '5', groupAccessSnapshotId: '7' }), null)
   assert.equal(validateGlobalSyncPage({
     scope: 'global', messages: [message('6', { organization: 902 })],
     next_after_global_seq: '6', has_more: false,
-    cross_org_access_snapshot_id: '42'
-  }, { organization: '901', afterGlobalSeq: '5' }), null)
+    cross_org_access_snapshot_id: '42', access_snapshot_id: '7'
+  }, { organization: '901', afterGlobalSeq: '5', groupAccessSnapshotId: '7' }), null)
   assert.equal(validateGlobalSyncPage({
     scope: 'global', messages: [message('7'), message('6')],
     next_after_global_seq: '7', has_more: false,
-    cross_org_access_snapshot_id: '42'
-  }, { organization: '901', afterGlobalSeq: '5' }), null)
+    cross_org_access_snapshot_id: '42', access_snapshot_id: '7'
+  }, { organization: '901', afterGlobalSeq: '5', groupAccessSnapshotId: '7' }), null)
   assert.equal(validateGlobalSyncPage({
     scope: 'global', messages: [message('6'), message('7', { message_id: 'message-6' })],
     next_after_global_seq: '7', has_more: false,
-    cross_org_access_snapshot_id: '42'
-  }, { organization: '901', afterGlobalSeq: '5' }), null)
+    cross_org_access_snapshot_id: '42', access_snapshot_id: '7'
+  }, { organization: '901', afterGlobalSeq: '5', groupAccessSnapshotId: '7' }), null)
 })
 
 test('global cursor is monotonic only inside its recoverable runtime', () => {

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { Plus, RefreshCw, Search, Trash2 } from '@lucide/vue'
 import StatePanel from './StatePanel.vue'
 import { createCsConversation, fetchMyCsConversations, type CustomerServiceConversation } from '../services/customerService'
@@ -14,6 +14,7 @@ import { fetchStickerItems, fetchStickerPacks, type StickerItem, type StickerPac
 import type { ClientModuleKey } from '../services/clientModules'
 import type { TenantBrandConfig } from '../services/tenantConfig'
 import type { WebImSession } from '../types'
+import { GROUP_ACCESS_BROWSER_EVENT } from '../services/groupMemberAccess'
 
 const props = defineProps<{
   moduleKey: Exclude<ClientModuleKey, 'announcement'>
@@ -162,7 +163,16 @@ async function likeMoment(item: MomentsPost) {
 }
 
 watch(() => props.moduleKey, load)
-onMounted(load)
+function clearAccessControlledSearch() {
+  searchHits.value = []
+}
+onMounted(() => {
+  window.addEventListener(GROUP_ACCESS_BROWSER_EVENT, clearAccessControlledSearch)
+  void load()
+})
+onBeforeUnmount(() => {
+  window.removeEventListener(GROUP_ACCESS_BROWSER_EVENT, clearAccessControlledSearch)
+})
 </script>
 
 <template>
@@ -211,7 +221,7 @@ onMounted(load)
         <section class="module-grid"><article v-for="folder in folders" :key="`f-${folder.id}`"><strong>📁 {{ folder.name }}</strong><small>{{ folder.createTime }}</small></article><article v-for="item in files" :key="`i-${item.id}`"><strong>{{ item.name }}</strong><p>{{ item.kind }} · {{ (item.sizeBytes / 1024).toFixed(1) }} KB</p></article></section>
       </template>
 
-      <section v-else-if="moduleKey === 'search'" class="module-list"><article v-for="item in searchHits" :key="item.messageId"><div><strong>{{ searchSenderLabel(item) }}</strong><p>{{ item.content }}</p><small>{{ item.sentAt || item.conversationId }}</small></div></article></section>
+      <section v-else-if="moduleKey === 'search'" class="module-list"><article v-for="item in searchHits" :key="item.messageId"><div><strong>{{ searchSenderLabel(item) }}</strong><p>{{ item.content }}</p><small>{{ item.conversationType === 'group' ? '群聊' : '单聊' }} · {{ item.sentAt || '时间未知' }} · {{ item.conversationId }}</small></div></article></section>
 
       <section v-else-if="moduleKey === 'moments'" class="module-list"><article v-for="item in moments" :key="item.id"><div><strong>{{ item.userId }}</strong><p>{{ item.content }}</p><small>{{ item.createTime }} · {{ item.commentCount }} 条评论</small></div><button @click="likeMoment(item)">{{ item.liked ? '已赞' : '点赞' }} {{ item.likeCount }}</button></article></section>
 

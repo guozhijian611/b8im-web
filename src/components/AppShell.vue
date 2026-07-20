@@ -587,7 +587,8 @@ async function handleUpdateGroupAvatar(file: File) {
   groupProfileSaving.value = true
   try {
     const asset = await uploadImAsset(props.tenantConfig, props.webSession, file, 'image', {
-      conversationType: 'group'
+      conversationType: 'group',
+      conversationId: conversation.conversationId
     })
     await updateGroupProfile(conversation.id, { avatarFileId: asset.fileId })
     layer.success('群头像已更新')

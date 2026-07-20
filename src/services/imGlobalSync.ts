@@ -5,6 +5,7 @@ import {
   type AccessSnapshotObservation
 } from './conversationAccess.ts'
 import { normalizeImOrganization } from './imIdentity.ts'
+import { normalizePositiveDecimal } from './groupMemberAccess.ts'
 
 const GLOBAL_SEQUENCE_PATTERN = /^(0|[1-9]\d{0,19})$/
 
@@ -14,11 +15,13 @@ export interface GlobalSyncPage {
   nextAfterGlobalSeq: string
   hasMore: boolean
   accessSnapshotId: string
+  groupAccessSnapshotId: string
 }
 
 export interface GlobalSyncPageContext {
   organization: string
   afterGlobalSeq: string
+  groupAccessSnapshotId: string
 }
 
 export function canRecoverGlobalSyncConversation(
@@ -86,7 +89,9 @@ export function validateGlobalSyncPage(
   const accessSnapshotId = normalizeAccessSnapshotId(
     value.cross_org_access_snapshot_id
   )
+  const groupAccessSnapshotId = normalizePositiveDecimal(value.access_snapshot_id)
   if (!afterGlobalSeq || !nextAfterGlobalSeq || !accessSnapshotId ||
+    !groupAccessSnapshotId || groupAccessSnapshotId !== context.groupAccessSnapshotId ||
     compareGlobalSequences(nextAfterGlobalSeq, afterGlobalSeq) < 0 ||
     (value.has_more && compareGlobalSequences(nextAfterGlobalSeq, afterGlobalSeq) <= 0)) {
     return null
@@ -125,7 +130,8 @@ export function validateGlobalSyncPage(
     messages,
     nextAfterGlobalSeq,
     hasMore: value.has_more,
-    accessSnapshotId
+    accessSnapshotId,
+    groupAccessSnapshotId
   }
 }
 
