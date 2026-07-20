@@ -5,6 +5,13 @@ import {
   tryStartTelemetrySpan,
   type TraceContext
 } from './telemetry.ts'
+import {
+  captureConversationAccessEpoch,
+  captureOrganizationAccessEpoch,
+  isConversationAccessEpochCurrent,
+  ConversationAccessEpochChangedError,
+  type ConversationAccessEpochToken
+} from './conversationAccess.ts'
 
 interface ApiResponse<T> {
   code?: number
@@ -44,6 +51,38 @@ export class WebApiError extends Error {
 
 const API_TIMEOUT_MS = 15000
 
+function requestAccessEpoch(
+  config: TenantBrandConfig,
+  token: string | undefined
+): ConversationAccessEpochToken | null {
+  if (!token) return null
+  try {
+    const encoded = token.split('.')[1]
+    if (!encoded) return null
+    const normalized = encoded.replace(/-/g, '+').replace(/_/g, '/')
+    const padded = normalized.padEnd(Math.ceil(normalized.length / 4) * 4, '=')
+    const payload = JSON.parse(
+      new TextDecoder().decode(
+        Uint8Array.from(atob(padded), (character) => character.charCodeAt(0))
+      )
+    ) as Record<string, unknown>
+    const userId = typeof payload.user_id === 'string'
+      ? payload.user_id.trim()
+      : ''
+    return userId
+      ? captureConversationAccessEpoch(config.organization, userId)
+      : captureOrganizationAccessEpoch(config.organization)
+  } catch {
+    return captureOrganizationAccessEpoch(config.organization)
+  }
+}
+
+function assertRequestAccessEpoch(token: ConversationAccessEpochToken | null) {
+  if (token && !isConversationAccessEpochCurrent(token)) {
+    throw new ConversationAccessEpochChangedError()
+  }
+}
+
 function assertApiContext(config: TenantBrandConfig) {
   if (!config.discovered || !config.organization || !config.serverInfo.apiServerUrl) {
     throw new Error('尚未建立有效的租户 API 上下文')
@@ -82,6 +121,7 @@ export async function requestWebApi<T>(
   options: WebApiOptions = {}
 ): Promise<T> {
   const method = options.method ?? 'GET'
+  const accessEpoch = requestAccessEpoch(config, options.token)
   const requestSpan = tryStartTelemetrySpan({
     name: 'web.http.request',
     kind: 'client',
@@ -197,6 +237,21 @@ export async function requestWebApi<T>(
         payload.code
       )
     }
+    try {
+      assertRequestAccessEpoch(accessEpoch)
+    } catch (error) {
+      attemptSpan?.fail({
+        code: 'HTTP_ACCESS_EPOCH_CHANGED',
+        type: 'authorization_changed',
+        retryCount: attempt
+      }, { statusCode: response.status })
+      requestSpan?.fail({
+        code: 'HTTP_ACCESS_EPOCH_CHANGED',
+        type: 'authorization_changed',
+        retryCount: attempt
+      }, { statusCode: response.status })
+      throw error
+    }
     attemptSpan?.end({ statusCode: response.status, retryCount: attempt })
     requestSpan?.end({ statusCode: response.status, retryCount: attempt })
     return payload.data as T
@@ -214,6 +269,7 @@ export function requestWebApiWithUpload<T>(
   options: WebApiUploadOptions
 ): Promise<T> {
   return new Promise((resolve, reject) => {
+    const accessEpoch = requestAccessEpoch(config, options.token)
     const uploadSpan = tryStartTelemetrySpan({
       name: 'web.http.upload',
       kind: 'client',
@@ -240,6 +296,7 @@ export function requestWebApiWithUpload<T>(
 
     xhr.upload.onprogress = (event) => {
       if (!event.lengthComputable || !options.onProgress) return
+      if (accessEpoch && !isConversationAccessEpochCurrent(accessEpoch)) return
       options.onProgress(Math.round((event.loaded / event.total) * 100))
     }
     xhr.onerror = () => {
@@ -263,6 +320,14 @@ export function requestWebApiWithUpload<T>(
           type: 'api_error'
         }, { statusCode: xhr.status })
         reject(new WebApiError(payload.message || `请求失败：${xhr.status}`, xhr.status, payload.code))
+        return
+      }
+      if (accessEpoch && !isConversationAccessEpochCurrent(accessEpoch)) {
+        uploadSpan?.fail({
+          code: 'HTTP_ACCESS_EPOCH_CHANGED',
+          type: 'authorization_changed'
+        }, { statusCode: xhr.status })
+        reject(new ConversationAccessEpochChangedError())
         return
       }
       uploadSpan?.end({ statusCode: xhr.status })

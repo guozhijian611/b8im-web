@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { Check, MessageCircle, Phone, Search, UserPlus, Video, X } from '@lucide/vue'
 import {
   fetchContacts,
@@ -10,6 +10,8 @@ import {
   updateFriendRemark
 } from '../services/webIm'
 import { layer } from '../services/layer'
+import { imIdentityKey } from '../services/imIdentity'
+import { CONVERSATION_ACCESS_BROWSER_EVENT } from '../services/conversationAccess'
 import type { TenantBrandConfig } from '../services/tenantConfig'
 import type { Contact, FriendRequest, WebImSession, WebImUser } from '../types'
 
@@ -37,6 +39,10 @@ const selectedGroupUserIds = ref<string[]>([])
 const loading = ref(false)
 const searching = ref(false)
 const errorMessage = ref('')
+let contactsLoadSequence = 0
+let requestsLoadSequence = 0
+let searchSequence = 0
+let accessSearchRefreshTimer = 0
 
 const filteredContacts = computed(() => {
   const value = keyword.value.trim().toLowerCase()
@@ -52,55 +58,84 @@ const incomingPendingRequests = computed(() =>
   requests.value.filter((item) => item.direction === 'incoming' && item.status === 1)
 )
 
-const groupCandidates = computed(() => contacts.value.filter((contact) => !contact.isSystem))
-
-const selectedGroupContacts = computed(() =>
-  groupCandidates.value.filter((contact) => selectedGroupUserIds.value.includes(contact.userId))
+const groupCandidates = computed(() =>
+  contacts.value.filter(
+    (contact) =>
+      !contact.isSystem &&
+      contact.organization === props.webSession.organization
+  )
 )
 
+const selectedGroupContacts = computed(() =>
+  groupCandidates.value.filter((contact) =>
+    selectedGroupUserIds.value.includes(contactIdentity(contact))
+  )
+)
+
+function contactIdentity(contact: Pick<Contact, 'organization' | 'userId'>) {
+  return imIdentityKey(contact.organization, contact.userId)
+}
+
+function userIdentity(user: Pick<WebImUser, 'organization' | 'userId'>) {
+  return imIdentityKey(user.organization, user.userId)
+}
+
 async function loadContacts() {
+  const sequence = ++contactsLoadSequence
   loading.value = true
   errorMessage.value = ''
   try {
-    contacts.value = await fetchContacts(props.tenantConfig, props.webSession)
+    const loaded = await fetchContacts(props.tenantConfig, props.webSession)
+    if (sequence !== contactsLoadSequence) return
+    contacts.value = loaded
     activeContact.value = contacts.value[0] ?? null
   } catch (error) {
+    if (sequence !== contactsLoadSequence) return
     errorMessage.value = error instanceof Error ? error.message : '联系人加载失败'
     contacts.value = []
     activeContact.value = null
   } finally {
-    loading.value = false
+    if (sequence === contactsLoadSequence) loading.value = false
   }
 }
 
 async function loadRequests() {
+  const sequence = ++requestsLoadSequence
   loading.value = true
   errorMessage.value = ''
   try {
-    requests.value = await fetchFriendRequests(props.tenantConfig, props.webSession)
+    const loaded = await fetchFriendRequests(props.tenantConfig, props.webSession)
+    if (sequence !== requestsLoadSequence) return
+    requests.value = loaded
     emit('update-request-count', incomingPendingRequests.value.length)
   } catch (error) {
+    if (sequence !== requestsLoadSequence) return
     errorMessage.value = error instanceof Error ? error.message : '好友申请加载失败'
     layer.error(errorMessage.value)
   } finally {
-    loading.value = false
+    if (sequence === requestsLoadSequence) loading.value = false
   }
 }
 
 async function submitSearch() {
+  const sequence = ++searchSequence
   const value = userKeyword.value.trim()
   if (!value) {
     searchResults.value = []
+    searching.value = false
     return
   }
 
   searching.value = true
   try {
-    searchResults.value = await searchUsers(props.tenantConfig, props.webSession, value)
+    const loaded = await searchUsers(props.tenantConfig, props.webSession, value)
+    if (sequence !== searchSequence) return
+    searchResults.value = loaded
   } catch (error) {
+    if (sequence !== searchSequence) return
     layer.error(error instanceof Error ? error.message : '搜索失败')
   } finally {
-    searching.value = false
+    if (sequence === searchSequence) searching.value = false
   }
 }
 
@@ -109,6 +144,7 @@ async function addFriend(user: WebImUser) {
     const result = await sendFriendRequest(
       props.tenantConfig,
       props.webSession,
+      user.organization,
       user.userId,
       requestMessage.value
     )
@@ -123,7 +159,7 @@ async function addFriend(user: WebImUser) {
 
 async function resolveRequest(request: FriendRequest, action: 'accept' | 'reject') {
   try {
-    await handleFriendRequest(props.tenantConfig, props.webSession, request.id, action)
+    await handleFriendRequest(props.tenantConfig, props.webSession, request, action)
     layer.success(action === 'accept' ? '已通过好友申请' : '已拒绝好友申请')
     await loadRequests()
     await loadContacts()
@@ -136,7 +172,13 @@ async function editRemark(contact: Contact) {
   const remark = window.prompt('设置好友备注', contact.remark || contact.name)
   if (remark === null) return
   try {
-    await updateFriendRemark(props.tenantConfig, props.webSession, contact.userId, remark.trim())
+    await updateFriendRemark(
+      props.tenantConfig,
+      props.webSession,
+      contact.organization,
+      contact.userId,
+      remark.trim()
+    )
     layer.success('好友备注已更新')
     await loadContacts()
   } catch (error) {
@@ -180,9 +222,98 @@ function requestStatusText(request: FriendRequest) {
   return request.statusText
 }
 
+function handleConversationAccessChanged(event: Event) {
+  const detail = (event as CustomEvent<{
+    allowed?: boolean
+    refresh?: boolean
+    organization?: string
+    userId?: string
+  }>).detail
+  const organization = String(detail?.organization ?? '')
+  const userId = String(detail?.userId ?? '')
+  searchSequence += 1
+  searching.value = false
+  if (detail?.allowed === false && organization && userId) {
+    const identity = imIdentityKey(organization, userId)
+    contacts.value = contacts.value.filter(
+      (contact) => contactIdentity(contact) !== identity
+    )
+    searchResults.value = searchResults.value.filter(
+      (user) => userIdentity(user) !== identity
+    )
+    selectedGroupUserIds.value = selectedGroupUserIds.value.filter(
+      (selected) => selected !== identity
+    )
+    if (activeContact.value && contactIdentity(activeContact.value) === identity) {
+      activeContact.value = contacts.value[0] ?? null
+    }
+    requests.value = requests.value.filter((request) => {
+      const fromMatches = request.fromOrganization === organization &&
+        (!request.fromUser || request.fromUser.userId === userId)
+      const toMatches = request.toOrganization === organization &&
+        (!request.toUser || request.toUser.userId === userId)
+      return !fromMatches && !toMatches
+    })
+    searchResults.value = searchResults.value.filter(
+      (user) => user.organization === props.webSession.organization
+    )
+    emit('update-request-count', incomingPendingRequests.value.length)
+  } else if (detail?.allowed === false) {
+    contacts.value = contacts.value.filter(
+      (contact) => contact.organization === props.webSession.organization
+    )
+    searchResults.value = searchResults.value.filter(
+      (user) => user.organization === props.webSession.organization
+    )
+    selectedGroupUserIds.value = selectedGroupUserIds.value.filter(
+      (identity) => identity.startsWith(`${props.webSession.organization}:`)
+    )
+    requests.value = requests.value.filter((request) =>
+      request.fromOrganization === props.webSession.organization &&
+      request.toOrganization === props.webSession.organization
+    )
+    if (
+      activeContact.value &&
+      activeContact.value.organization !== props.webSession.organization
+    ) {
+      activeContact.value = contacts.value[0] ?? null
+    }
+    emit('update-request-count', incomingPendingRequests.value.length)
+  }
+  if (detail?.refresh === false) {
+    window.clearTimeout(accessSearchRefreshTimer)
+    if (userKeyword.value.trim()) {
+      accessSearchRefreshTimer = window.setTimeout(() => {
+        void submitSearch()
+      }, 0)
+    }
+    return
+  }
+  void Promise.allSettled([loadContacts(), loadRequests()]).then(() => {
+    if (userKeyword.value.trim()) {
+      void submitSearch()
+    } else {
+      searchResults.value = []
+      searching.value = false
+    }
+  })
+}
+
 onMounted(async () => {
+  window.addEventListener(
+    CONVERSATION_ACCESS_BROWSER_EVENT,
+    handleConversationAccessChanged
+  )
   await loadContacts()
   await loadRequests()
+})
+
+onBeforeUnmount(() => {
+  window.clearTimeout(accessSearchRefreshTimer)
+  window.removeEventListener(
+    CONVERSATION_ACCESS_BROWSER_EVENT,
+    handleConversationAccessChanged
+  )
 })
 
 watch(
@@ -225,8 +356,12 @@ watch(
         <div v-else-if="filteredContacts.length === 0" class="state-row">暂无好友</div>
         <button
           v-for="contact in filteredContacts"
-          :key="contact.id"
-          :class="{ active: activeMode === 'friends' && activeContact?.id === contact.id }"
+          :key="contactIdentity(contact)"
+          :class="{
+            active: activeMode === 'friends' &&
+              activeContact &&
+              contactIdentity(activeContact) === contactIdentity(contact)
+          }"
           type="button"
           @click="activeMode = 'friends'; activeContact = contact"
         >
@@ -333,7 +468,7 @@ watch(
       <textarea v-model="requestMessage" class="request-message" maxlength="120" />
       <div v-if="searchResults.length === 0" class="state-row">输入关键词后搜索用户</div>
       <div v-else class="request-list">
-        <article v-for="user in searchResults" :key="user.userId" class="request-card">
+        <article v-for="user in searchResults" :key="userIdentity(user)" class="request-card">
           <span class="avatar mini">
             <img v-if="user.avatarUrl" :src="user.avatarUrl" :alt="user.nickname" />
             <template v-else>{{ user.nickname.slice(0, 1) || '友' }}</template>
@@ -367,8 +502,8 @@ watch(
       </form>
       <div v-if="groupCandidates.length === 0" class="state-row">暂无可邀请好友</div>
       <div v-else class="request-list">
-        <label v-for="contact in groupCandidates" :key="contact.userId" class="request-card selectable-card">
-          <input v-model="selectedGroupUserIds" type="checkbox" :value="contact.userId" />
+        <label v-for="contact in groupCandidates" :key="contactIdentity(contact)" class="request-card selectable-card">
+          <input v-model="selectedGroupUserIds" type="checkbox" :value="contactIdentity(contact)" />
           <span class="avatar mini">
             <img v-if="contact.avatarUrl" :src="contact.avatarUrl" :alt="contact.name" />
             <template v-else>{{ contact.avatar }}</template>

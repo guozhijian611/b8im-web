@@ -6,6 +6,8 @@ import { CONTEXT_MENU_CLOSE_EVENT, emitCloseContextMenus, isCloseFromSource } fr
 import { layer } from '../services/layer'
 import type { TenantBrandConfig } from '../services/tenantConfig'
 import { fetchContacts } from '../services/webIm'
+import { imIdentityKey } from '../services/imIdentity'
+import { CONVERSATION_ACCESS_BROWSER_EVENT } from '../services/conversationAccess'
 import type { Contact, ImConnectionState, ImConversation, MessageGroup, MessageGroupLayout, WebImSession } from '../types'
 
 const props = defineProps<{
@@ -75,6 +77,7 @@ const startDialog = ref({
   loading: false
 })
 const contacts = ref<Contact[]>([])
+let startContactsLoadSequence = 0
 
 const filteredConversations = computed(() => {
   const value = keyword.value.trim().toLowerCase()
@@ -101,7 +104,11 @@ const startDialogTitle = computed(() => startDialog.value.mode === 'single' ? '�
 const filteredStartContacts = computed(() => {
   const keyword = startDialog.value.keyword.trim().toLowerCase()
   const candidates = startDialog.value.mode === 'group'
-    ? contacts.value.filter((contact) => !contact.isSystem)
+    ? contacts.value.filter(
+        (contact) =>
+          !contact.isSystem &&
+          contact.organization === props.webSession.organization
+      )
     : contacts.value
 
   if (!keyword) return candidates
@@ -112,7 +119,11 @@ const filteredStartContacts = computed(() => {
   })
 })
 const selectedStartContacts = computed(() =>
-  contacts.value.filter((contact) => startDialog.value.selectedUserIds.includes(contact.userId))
+  contacts.value.filter((contact) =>
+    startDialog.value.selectedUserIds.includes(
+      imIdentityKey(contact.organization, contact.userId)
+    )
+  )
 )
 const startDialogSubtitle = computed(() => {
   if (startDialog.value.mode === 'single') return '选择一个好友开始聊天'
@@ -171,6 +182,7 @@ function closeStartMenu() {
 }
 
 async function openStartDialog(mode: 'single' | 'group') {
+  const sequence = ++startContactsLoadSequence
   closeStartMenu()
   startDialog.value = {
     visible: true,
@@ -181,11 +193,15 @@ async function openStartDialog(mode: 'single' | 'group') {
     loading: true
   }
   try {
-    contacts.value = await fetchContacts(props.tenantConfig, props.webSession)
+    const loaded = await fetchContacts(props.tenantConfig, props.webSession)
+    if (sequence !== startContactsLoadSequence) return
+    contacts.value = loaded
   } catch (error) {
+    if (sequence !== startContactsLoadSequence) return
     contacts.value = []
     layer.error(error instanceof Error ? error.message : '联系人加载失败')
   } finally {
+    if (sequence !== startContactsLoadSequence) return
     startDialog.value.loading = false
     await nextTick()
     startDialogSearchInput.value?.focus()
@@ -196,15 +212,64 @@ function closeStartDialog() {
   startDialog.value.visible = false
 }
 
+async function refreshStartContacts() {
+  const sequence = ++startContactsLoadSequence
+  try {
+    const loaded = await fetchContacts(props.tenantConfig, props.webSession)
+    if (sequence === startContactsLoadSequence) contacts.value = loaded
+  } catch {
+    // The next explicit dialog open retries with visible feedback.
+  } finally {
+    if (sequence === startContactsLoadSequence) {
+      startDialog.value.loading = false
+    }
+  }
+}
+
+function handleConversationAccessChanged(event: Event) {
+  const detail = (event as CustomEvent<{
+    allowed?: boolean
+    refresh?: boolean
+    organization?: string
+    userId?: string
+  }>).detail
+  const organization = String(detail?.organization ?? '')
+  const userId = String(detail?.userId ?? '')
+  if (detail?.allowed === false && organization && userId) {
+    const identity = imIdentityKey(organization, userId)
+    contacts.value = contacts.value.filter(
+      (contact) =>
+        contact.organization === props.webSession.organization &&
+        imIdentityKey(contact.organization, contact.userId) !== identity
+    )
+    startDialog.value.selectedUserIds = startDialog.value.selectedUserIds.filter(
+      (selected) => selected !== identity
+    )
+  } else if (detail?.allowed === false) {
+    contacts.value = contacts.value.filter(
+      (contact) => contact.organization === props.webSession.organization
+    )
+    startDialog.value.selectedUserIds =
+      startDialog.value.selectedUserIds.filter(
+        (identity) =>
+          identity.startsWith(`${props.webSession.organization}:`)
+      )
+  }
+  if (detail?.refresh === false) return
+  void refreshStartContacts()
+}
+
 function toggleStartContact(contact: Contact) {
+  const identity = imIdentityKey(contact.organization, contact.userId)
+  if (!identity) return
   if (startDialog.value.mode === 'single') {
-    startDialog.value.selectedUserIds = [contact.userId]
+    startDialog.value.selectedUserIds = [identity]
     return
   }
 
-  startDialog.value.selectedUserIds = startDialog.value.selectedUserIds.includes(contact.userId)
-    ? startDialog.value.selectedUserIds.filter((userId) => userId !== contact.userId)
-    : [...startDialog.value.selectedUserIds, contact.userId]
+  startDialog.value.selectedUserIds = startDialog.value.selectedUserIds.includes(identity)
+    ? startDialog.value.selectedUserIds.filter((value) => value !== identity)
+    : [...startDialog.value.selectedUserIds, identity]
 }
 
 function submitStartDialog() {
@@ -337,11 +402,19 @@ function stopMessageGroupDrag(event: PointerEvent) {
 onMounted(() => {
   window.addEventListener('click', handleWindowClick)
   window.addEventListener(CONTEXT_MENU_CLOSE_EVENT, handleContextMenuClose)
+  window.addEventListener(
+    CONVERSATION_ACCESS_BROWSER_EVENT,
+    handleConversationAccessChanged
+  )
 })
 
 onBeforeUnmount(() => {
   window.removeEventListener('click', handleWindowClick)
   window.removeEventListener(CONTEXT_MENU_CLOSE_EVENT, handleContextMenuClose)
+  window.removeEventListener(
+    CONVERSATION_ACCESS_BROWSER_EVENT,
+    handleConversationAccessChanged
+  )
   window.removeEventListener('pointermove', moveMessageGroupDrag)
   window.removeEventListener('pointerup', stopMessageGroupDrag)
   window.removeEventListener('pointercancel', stopMessageGroupDrag)
@@ -516,10 +589,10 @@ onBeforeUnmount(() => {
           <template v-else>
             <button
               v-for="contact in filteredStartContacts"
-              :key="contact.userId"
+              :key="imIdentityKey(contact.organization, contact.userId)"
               type="button"
               class="start-chat-contact"
-              :class="{ active: startDialog.selectedUserIds.includes(contact.userId) }"
+              :class="{ active: startDialog.selectedUserIds.includes(imIdentityKey(contact.organization, contact.userId)) }"
               @click="toggleStartContact(contact)"
             >
               <span class="start-chat-check" aria-hidden="true"></span>

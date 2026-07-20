@@ -65,6 +65,7 @@ function loginPayload(deviceId: string, overrides: Record<string, unknown> = {})
   return {
     organization: 901,
     deployment_id: 'deployment-test',
+    cross_org_access_snapshot_id: '42',
     token: {
       expires_in: 3600,
       access_token: jwt({
@@ -79,6 +80,7 @@ function loginPayload(deviceId: string, overrides: Record<string, unknown> = {})
     },
     user: {
       id: 7,
+      organization: 901,
       user_id: 'user-7',
       account: 'qa-user',
       nickname: '测试用户'
@@ -123,6 +125,7 @@ test('registration sends password confirmation and persists only the normalized 
     assert.equal(requests[0].body.password_confirm, 'password-123')
     assert.equal(session.organization, '901')
     assert.equal(session.deploymentId, 'deployment-test')
+    assert.equal(session.crossOrgAccessSnapshotId, '42')
     assert.ok(storage.allValues().every((value) => !value.includes('browser-secret')))
   } finally {
     globalThis.fetch = originalFetch
@@ -172,6 +175,7 @@ test('QR flow accepts consumed and validates a confirmed session before returnin
     assert.equal(consumed.session, null)
     assert.equal(confirmed.status, 'confirmed')
     assert.equal(confirmed.session.organization, '901')
+    assert.equal(confirmed.session.crossOrgAccessSnapshotId, '42')
     assert.ok(requestBodies.every((body) => body.device_id === deviceId))
     assert.ok(requestBodies.slice(1).every((body) => body.browser_token === 'browser-secret'))
     assert.ok(storage.allValues().every((value) => !value.includes('browser-secret')))
@@ -231,6 +235,29 @@ test('confirmed QR login rejects organization, deployment and JWT context mismat
     await assert.rejects(
       () => webIm.pollQrLogin(config, { qrId: 'qr-session-2', browserToken: 'browser-secret-2' }),
       /web-api 凭证与当前部署或机构不一致/
+    )
+
+    responseData = {
+      status: 'confirmed',
+      ...loginPayload(deviceId, { cross_org_access_snapshot_id: '0' })
+    }
+    const failClosed = await webIm.pollQrLogin(
+      config,
+      { qrId: 'qr-session-2', browserToken: 'browser-secret-2' }
+    )
+    assert.equal(failClosed.status, 'confirmed')
+    assert.equal(
+      failClosed.session?.crossOrgAccessSnapshotId,
+      '0'
+    )
+
+    responseData = {
+      status: 'confirmed',
+      ...loginPayload(deviceId, { cross_org_access_snapshot_id: 42 })
+    }
+    await assert.rejects(
+      () => webIm.pollQrLogin(config, { qrId: 'qr-session-2', browserToken: 'browser-secret-2' }),
+      /缺少有效跨机构访问快照 ID/
     )
   } finally {
     globalThis.fetch = originalFetch

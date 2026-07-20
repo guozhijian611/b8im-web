@@ -1,3 +1,5 @@
+import { isSameImIdentity, normalizeImOrganization } from './imIdentity.ts'
+
 export const MAX_RECENT_REALTIME_EVENT_IDS = 2048
 export const REALTIME_EVENT_ID_PATTERN = /^[a-f0-9]{64}$/
 
@@ -25,6 +27,49 @@ export interface RealtimeEventStorage {
   getItem(key: string): string | null
   setItem(key: string, value: string): void
 }
+
+export interface ImConversationIdentityContext {
+  conversationId: string
+  conversationType: 'single' | 'group'
+  peerOrganization?: unknown
+  peerUserId?: unknown
+}
+
+export interface PendingImControlRequest {
+  command: 'send' | 'ack' | 'conversation_read' | 'recall' | 'edit' | 'delete' | 'screenshot'
+  clientMsgId: string
+  conversationId: string
+  messageId?: string
+  messageSeq?: number
+  status?: 'delivered' | 'read'
+  senderOrganization?: string
+  senderUserId?: string
+  conversationType?: 'single' | 'group'
+  peerOrganization?: string
+  peerUserId?: string
+  messageType?: number
+  content?: Record<string, unknown>
+  scope?: 'self' | 'both'
+  createdAt: number
+}
+
+export interface ImMessageEventContext {
+  conversationId: string
+  messageId: string
+  messageSeq: number
+  senderOrganization: unknown
+  senderUserId: unknown
+  messageType?: number | string
+  side?: 'in' | 'out' | 'system'
+}
+
+export type ReceiptEventDirection =
+  | 'peer_reads_current'
+  | 'current_reads_peer'
+  | 'group_member'
+  | 'invalid'
+
+export type ChangeSequenceDecision = 'apply' | 'stale' | 'gap' | 'invalid'
 
 interface PersistedRealtimeEvents {
   version: number
@@ -55,7 +100,8 @@ export function isCanonicalRealtimeCommand(value: unknown): value is CanonicalRe
  */
 export function isCanonicalRealtimeEventPacketValid(
   packet: RealtimeEventPacketLike,
-  organization: string
+  organization: string,
+  userId = ''
 ): boolean {
   if (!isCanonicalRealtimeCommand(packet.cmd)) return false
   if (String(packet.organization ?? '') !== organization || !isRecord(packet.data)) return false
@@ -75,7 +121,26 @@ export function isCanonicalRealtimeEventPacketValid(
       return false
     }
     const message = data.message
+    const senderOrganization = normalizeImOrganization(message.sender_organization)
+    const senderId = typeof message.sender_id === 'string' ? message.sender_id.trim() : ''
+    const senderUser = isRecord(message.sender_user) ? message.sender_user : null
+    if (
+      !senderOrganization ||
+      !senderId ||
+      (senderUser &&
+        !isSameImIdentity(
+          senderUser.organization,
+          senderUser.user_id,
+          senderOrganization,
+          message.sender_id
+        ))
+    ) {
+      return false
+    }
     return (
+      (packet.cmd !== 'edit' || (
+        hasMutationActor(data) && isPositiveSequence(data.change_seq)
+      )) &&
       String(message.organization ?? '') === organization &&
       String(message.message_id ?? '') === messageId &&
       String(message.conversation_id ?? '') === conversationId &&
@@ -84,13 +149,487 @@ export function isCanonicalRealtimeEventPacketValid(
   }
 
   if (packet.cmd === 'recall') {
-    return data.event_type === REALTIME_EVENT_TYPES.recall && data.status === 'recalled'
+    return data.event_type === REALTIME_EVENT_TYPES.recall &&
+      data.status === 'recalled' && hasMutationActor(data) &&
+      isPositiveSequence(data.change_seq)
   }
 
-  return (
-    (data.event_type === 'message.deleted_both' && data.scope === 'both') ||
-    (data.event_type === 'message.deleted_self' && data.scope === 'self')
+  if (!hasMutationActor(data) || !isPositiveSequence(data.change_seq)) return false
+  if (data.event_type === 'message.deleted_both' && data.scope === 'both') {
+    return data.target_organization == null && data.target_user_id == null
+  }
+  if (data.event_type !== 'message.deleted_self' || data.scope !== 'self') return false
+  return Boolean(userId.trim() && isSameImIdentity(
+    data.target_organization, data.target_user_id, organization, userId
+  ))
+}
+
+function isPositiveSequence(value: unknown) {
+  const sequence = Number(value ?? 0)
+  return Number.isSafeInteger(sequence) && sequence > 0
+}
+
+function hasMutationActor(data: Record<string, unknown>) {
+  return Boolean(
+    normalizeImOrganization(data.actor_organization) &&
+    typeof data.actor_user_id === 'string' &&
+    data.actor_user_id.trim() !== ''
   )
+}
+
+export function isConversationParticipantIdentity(
+  actorOrganization: unknown,
+  actorUserId: unknown,
+  organization: string,
+  userId: string,
+  conversation: ImConversationIdentityContext
+): boolean {
+  if (conversation.conversationType === 'group') {
+    return normalizeImOrganization(actorOrganization) === organization &&
+      String(actorUserId ?? '').trim() !== ''
+  }
+  return isSameImIdentity(actorOrganization, actorUserId, organization, userId) ||
+    isSameImIdentity(
+      actorOrganization,
+      actorUserId,
+      conversation.peerOrganization,
+      conversation.peerUserId
+    )
+}
+
+export function isMessageSenderValidForConversation(
+  message: Record<string, unknown>,
+  organization: string,
+  userId: string,
+  conversation: ImConversationIdentityContext
+): boolean {
+  if (
+    message.sender_user != null &&
+    (
+      !isRecord(message.sender_user) ||
+      !isSameImIdentity(
+        message.sender_user.organization,
+        message.sender_user.user_id,
+        message.sender_organization,
+        message.sender_id
+      )
+    )
+  ) {
+    return false
+  }
+  if (Number(message.message_type ?? 0) === 5) {
+    const content = isRecord(message.content) ? message.content : null
+    return Boolean(
+      normalizeImOrganization(message.sender_organization) === organization &&
+      String(message.sender_id ?? '').trim() &&
+      content &&
+      isConversationParticipantIdentity(
+        content.actor_organization,
+        content.actor_user_id,
+        organization,
+        userId,
+        conversation
+      )
+    )
+  }
+  return isConversationParticipantIdentity(
+    message.sender_organization,
+    message.sender_id,
+    organization,
+    userId,
+    conversation
+  )
+}
+
+export function isMessageValidForConversation(
+  message: Record<string, unknown>,
+  organization: string,
+  userId: string,
+  conversation: ImConversationIdentityContext
+): boolean {
+  const messageSequence = Number(message.message_seq ?? 0)
+  const expectedConversationType =
+    conversation.conversationType === 'single' ? 1 : 2
+  return Boolean(
+    String(message.organization ?? '') === organization &&
+    String(message.conversation_id ?? '').trim() === conversation.conversationId &&
+    Number(message.conversation_type ?? 0) === expectedConversationType &&
+    String(message.message_id ?? '').trim() &&
+    Number.isSafeInteger(messageSequence) &&
+    messageSequence > 0 &&
+    isMessageSenderValidForConversation(
+      message,
+      organization,
+      userId,
+      conversation
+    )
+  )
+}
+
+export function isDurableMutationValidForContext(
+  command: 'recall' | 'edit' | 'delete',
+  data: Record<string, unknown>,
+  organization: string,
+  userId: string,
+  conversation: ImConversationIdentityContext,
+  original: ImMessageEventContext
+): boolean {
+  if (!isConversationParticipantIdentity(
+    data.actor_organization,
+    data.actor_user_id,
+    organization,
+    userId,
+    conversation
+  )) return false
+  if (String(data.conversation_id ?? '') !== original.conversationId ||
+    String(data.message_id ?? '') !== original.messageId ||
+    Number(data.message_seq ?? 0) !== original.messageSeq) return false
+
+  const actorIsSender = isSameImIdentity(
+    data.actor_organization,
+    data.actor_user_id,
+    original.senderOrganization,
+    original.senderUserId
+  )
+  if (command === 'recall') return actorIsSender && data.status === 'recalled'
+  if (command === 'edit') {
+    if (
+      !actorIsSender ||
+      Number(original.messageType ?? 0) !== 1 ||
+      !isRecord(data.message) ||
+      !isMessageValidForConversation(
+        data.message,
+        organization,
+        userId,
+        conversation
+      )
+    ) {
+      return false
+    }
+    return isSameImIdentity(
+      data.message.sender_organization,
+      data.message.sender_id,
+      original.senderOrganization,
+      original.senderUserId
+    )
+  }
+  if (data.scope === 'both') {
+    return actorIsSender &&
+      data.target_organization == null &&
+      data.target_user_id == null
+  }
+  return data.scope === 'self' &&
+    isSameImIdentity(
+      data.actor_organization,
+      data.actor_user_id,
+      organization,
+      userId
+    ) &&
+    isSameImIdentity(
+      data.target_organization,
+      data.target_user_id,
+      organization,
+      userId
+    )
+}
+
+export function classifyReceiptEventDirection(
+  data: Record<string, unknown>,
+  organization: string,
+  userId: string,
+  conversation: ImConversationIdentityContext,
+  message?: ImMessageEventContext
+): ReceiptEventDirection {
+  const senderOrganization = normalizeImOrganization(data.sender_organization)
+  const userOrganization = normalizeImOrganization(data.user_organization)
+  const senderId = String(data.sender_id ?? '').trim()
+  const receiptUserId = String(data.user_id ?? '').trim()
+  const messageId = String(data.message_id ?? '').trim()
+  const conversationId = String(data.conversation_id ?? '').trim()
+  const status = data.status
+  const messageSeq = Number(data.message_seq ?? 0)
+  if (!senderOrganization || !userOrganization || !senderId || !receiptUserId ||
+    !messageId || conversationId !== conversation.conversationId ||
+    !Number.isSafeInteger(messageSeq) || messageSeq <= 0 ||
+    (status !== 'delivered' && status !== 'read') ||
+    data.event_type !== 'message.receipt') {
+    return 'invalid'
+  }
+  if (
+    message?.side === 'system' &&
+    message.conversationId === conversationId &&
+    message.messageId === messageId &&
+    message.messageSeq === messageSeq &&
+    isSameImIdentity(
+      senderOrganization,
+      senderId,
+      message.senderOrganization,
+      message.senderUserId
+    )
+  ) {
+    if (isSameImIdentity(userOrganization, receiptUserId, organization, userId)) {
+      return 'current_reads_peer'
+    }
+    if (conversation.conversationType === 'group') {
+      return userOrganization === organization ? 'group_member' : 'invalid'
+    }
+    return isSameImIdentity(
+      userOrganization,
+      receiptUserId,
+      conversation.peerOrganization,
+      conversation.peerUserId
+    ) ? 'group_member' : 'invalid'
+  }
+  if (conversation.conversationType === 'group') {
+    return senderOrganization === organization && userOrganization === organization
+      ? 'group_member'
+      : 'invalid'
+  }
+  const currentIsSender = isSameImIdentity(
+    senderOrganization, senderId, organization, userId
+  )
+  const peerIsReader = isSameImIdentity(
+    userOrganization, receiptUserId,
+    conversation.peerOrganization, conversation.peerUserId
+  )
+  if (currentIsSender && peerIsReader) return 'peer_reads_current'
+  const peerIsSender = isSameImIdentity(
+    senderOrganization, senderId,
+    conversation.peerOrganization, conversation.peerUserId
+  )
+  const currentIsReader = isSameImIdentity(
+    userOrganization, receiptUserId, organization, userId
+  )
+  return peerIsSender && currentIsReader ? 'current_reads_peer' : 'invalid'
+}
+
+export function isReceiptEventValidForConversation(
+  data: Record<string, unknown>,
+  organization: string,
+  userId: string,
+  conversation: ImConversationIdentityContext
+) {
+  return classifyReceiptEventDirection(data, organization, userId, conversation) !== 'invalid'
+}
+
+export function classifyConversationReadEventDirection(
+  data: Record<string, unknown>,
+  organization: string,
+  currentUserId: string,
+  conversation: ImConversationIdentityContext
+): ReceiptEventDirection {
+  const userOrganization = normalizeImOrganization(data.user_organization)
+  const userId = String(data.user_id ?? '').trim()
+  const conversationId = String(data.conversation_id ?? '').trim()
+  const lastReadSeq = Number(data.last_read_seq ?? 0)
+  if (!userOrganization || !userId ||
+    conversationId !== conversation.conversationId ||
+    !Number.isSafeInteger(lastReadSeq) || lastReadSeq <= 0 ||
+    data.event_type !== 'conversation.read') {
+    return 'invalid'
+  }
+  if (conversation.conversationType === 'group') {
+    return userOrganization === organization ? 'group_member' : 'invalid'
+  }
+  if (isSameImIdentity(userOrganization, userId, organization, currentUserId)) {
+    return 'current_reads_peer'
+  }
+  return isSameImIdentity(userOrganization, userId,
+    conversation.peerOrganization, conversation.peerUserId)
+    ? 'peer_reads_current'
+    : 'invalid'
+}
+
+export function isControlAckResponseValid(
+  packet: RealtimeEventPacketLike & { client_msg_id?: unknown },
+  expected: PendingImControlRequest,
+  organization: string,
+  userId: string
+): boolean {
+  if (!isRecord(packet.data)) return false
+  const data = packet.data
+  const clientMsgId = String(packet.client_msg_id ?? '').trim()
+  if (!clientMsgId || clientMsgId !== expected.clientMsgId) return false
+  if (
+    expected.command === 'recall' ||
+    expected.command === 'edit' ||
+    expected.command === 'delete' ||
+    expected.command === 'screenshot'
+  ) {
+    const packetClientMsgId = String(packet.client_msg_id ?? '').trim()
+    const dataClientMsgId = String(data.client_msg_id ?? '').trim()
+    const requestClientMsgId = String(data.request_client_msg_id ?? '').trim()
+    if (
+      packetClientMsgId !== expected.clientMsgId ||
+      dataClientMsgId !== expected.clientMsgId ||
+      requestClientMsgId !== expected.clientMsgId
+    ) {
+      return false
+    }
+  }
+  if (expected.command === 'send') {
+    if (packet.cmd !== 'send_ack' || !isRecord(data.message)) return false
+    const message = data.message
+    const conversationId = String(data.conversation_id ?? '').trim()
+    if (
+      !conversationId ||
+      (expected.conversationId !== '' && conversationId !== expected.conversationId)
+    ) {
+      return false
+    }
+    const expectedConversationType = expected.conversationType === 'single' ? 1 : 2
+    const messageId = String(message.message_id ?? '').trim()
+    const messageSequence = Number(message.message_seq ?? 0)
+    return Boolean(
+      String(message.client_msg_id ?? '').trim() === clientMsgId &&
+      String(data.client_msg_id ?? '').trim() === clientMsgId &&
+      String(message.conversation_id ?? '').trim() === conversationId &&
+      messageId &&
+      Number.isSafeInteger(messageSequence) &&
+      messageSequence > 0 &&
+      String(data.message_id ?? '').trim() === messageId &&
+      Number(data.message_seq ?? 0) === messageSequence &&
+      Number(message.conversation_type ?? 0) === expectedConversationType &&
+      String(message.organization ?? '') === organization &&
+      isSameImIdentity(message.sender_organization, message.sender_id, organization, userId) &&
+      Number(message.message_type ?? 0) === expected.messageType &&
+      containsExpectedContent(message.content, expected.content)
+    )
+  }
+  if (String(data.conversation_id ?? '').trim() !== expected.conversationId) return false
+  if (expected.command === 'ack') {
+    if (
+      String(data.client_msg_id ?? '').trim() !== expected.clientMsgId ||
+      String(data.request_client_msg_id ?? '').trim() !== expected.clientMsgId ||
+      !isSameImIdentity(
+        data.actor_organization,
+        data.actor_user_id,
+        organization,
+        userId
+      )
+    ) {
+      return false
+    }
+    const statusMatches = expected.status === 'delivered'
+      ? data.status === 'delivered' || data.status === 'read'
+      : data.status === 'read'
+    return Boolean(
+      packet.cmd === 'ack_ack' &&
+      isSameImIdentity(data.user_organization, data.user_id, organization, userId) &&
+      String(data.message_id ?? '').trim() === expected.messageId &&
+      Number(data.message_seq ?? 0) === expected.messageSeq &&
+      statusMatches &&
+      isSameImIdentity(
+        data.sender_organization,
+        data.sender_id,
+        expected.senderOrganization,
+        expected.senderUserId
+      )
+    )
+  }
+  if (expected.command === 'conversation_read') {
+    const responseSequence = Number(data.last_read_seq ?? 0)
+    const expectedSequence = Number(expected.messageSeq ?? 0)
+    return Boolean(
+      packet.cmd === 'conversation_read_ack' &&
+      isSameImIdentity(data.user_organization, data.user_id, organization, userId) &&
+      Number.isSafeInteger(responseSequence) &&
+      responseSequence >= expectedSequence &&
+      (
+        responseSequence > expectedSequence ||
+        String(data.last_read_message_id ?? '').trim() === expected.messageId
+      )
+    )
+  }
+  const commandMatches = packet.cmd === `${expected.command}_ack`
+  const actorMatches = isSameImIdentity(
+    data.actor_organization, data.actor_user_id, organization, userId
+  )
+  if (!commandMatches || !actorMatches) return false
+  if (expected.command === 'screenshot') return expected.messageId === undefined
+  if (String(data.message_id ?? '').trim() !== expected.messageId) return false
+  if (expected.command === 'recall') return data.recalled === true && isPositiveSequence(data.change_seq)
+  if (expected.command === 'edit') {
+    if (
+      !isPositiveSequence(data.change_seq) ||
+      !isRecord(data.content) ||
+      typeof data.content.text !== 'string' ||
+      data.content.text.trim() === '' ||
+      !isRecord(data.message)
+    ) {
+      return false
+    }
+    return Boolean(
+      String(data.message.organization ?? '') === organization &&
+      String(data.message.conversation_id ?? '').trim() === expected.conversationId &&
+      String(data.message.message_id ?? '').trim() === expected.messageId &&
+      Number(data.message.message_type ?? 0) === 1 &&
+      isSameImIdentity(
+        data.message.sender_organization,
+        data.message.sender_id,
+        organization,
+        userId
+      ) &&
+      deepEqual(data.message.content, data.content)
+    )
+  }
+  return data.scope === expected.scope && isPositiveSequence(data.change_seq)
+}
+
+function deepEqual(left: unknown, right: unknown): boolean {
+  if (Object.is(left, right)) return true
+  if (Array.isArray(left) || Array.isArray(right)) {
+    return Array.isArray(left) && Array.isArray(right) &&
+      left.length === right.length &&
+      left.every((item, index) => deepEqual(item, right[index]))
+  }
+  if (!isRecord(left) || !isRecord(right)) return false
+  const leftKeys = Object.keys(left).sort()
+  const rightKeys = Object.keys(right).sort()
+  return leftKeys.length === rightKeys.length &&
+    leftKeys.every((key, index) =>
+      key === rightKeys[index] && deepEqual(left[key], right[key])
+    )
+}
+
+function containsExpectedContent(actual: unknown, expected: unknown): boolean {
+  if (!isRecord(expected)) return deepEqual(actual, expected)
+  if (!isRecord(actual)) return false
+  return Object.entries(expected).every(([key, value]) =>
+    containsExpectedContent(actual[key], value)
+  )
+}
+
+export function classifyMutationChangeSequence(
+  lastConversationSequence: number,
+  lastMessageSequence: number,
+  incomingSequence: unknown
+): ChangeSequenceDecision {
+  const incoming = Number(incomingSequence ?? 0)
+  if (!Number.isSafeInteger(incoming) || incoming <= 0) return 'invalid'
+  if (incoming <= lastConversationSequence || incoming <= lastMessageSequence) return 'stale'
+  return incoming === lastConversationSequence + 1 ? 'apply' : 'gap'
+}
+
+export function isPendingImRequestExpired(
+  request: Pick<PendingImControlRequest, 'createdAt'>,
+  now: number,
+  timeoutMs: number
+) {
+  return !Number.isFinite(request.createdAt) || now - request.createdAt >= timeoutMs
+}
+
+export function reusablePendingScreenshotClientMsgId(
+  request: PendingImControlRequest | null | undefined,
+  conversationId: string,
+  now: number,
+  timeoutMs: number
+) {
+  return request?.command === 'screenshot' &&
+    request.conversationId === conversationId &&
+    !isPendingImRequestExpired(request, now, timeoutMs)
+    ? request.clientMsgId
+    : ''
 }
 
 /**
@@ -110,12 +649,23 @@ export function isFriendRequestRealtimeEventPacketValid(
   if (!Number.isSafeInteger(data.request_id) || Number(data.request_id) <= 0) return false
   if (!Number.isSafeInteger(data.pending_count) || Number(data.pending_count) < 0) return false
   if (typeof data.from_user_id !== 'string' || data.from_user_id.trim() === '') return false
+  if (!normalizeImOrganization(data.from_organization)) return false
+  if (String(data.to_organization ?? '') !== organization) return false
   if (typeof data.to_user_id !== 'string' || data.to_user_id !== userId) return false
   if (typeof data.message !== 'string' || typeof data.create_time !== 'string' || data.create_time.trim() === '') {
     return false
   }
 
-  return data.from_user === null || data.from_user === undefined || isRecord(data.from_user)
+  if (data.from_user === null || data.from_user === undefined) return true
+  return (
+    isRecord(data.from_user) &&
+    isSameImIdentity(
+      data.from_user.organization,
+      data.from_user.user_id,
+      data.from_organization,
+      data.from_user_id
+    )
+  )
 }
 
 export function browserSessionStorage(): RealtimeEventStorage | null {

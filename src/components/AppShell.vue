@@ -26,6 +26,7 @@ import SettingsView from './SettingsView.vue'
 import SideRail from './SideRail.vue'
 import { useImRuntime } from '../composables/useImRuntime'
 import { layer } from '../services/layer'
+import { CONVERSATION_ACCESS_BROWSER_EVENT } from '../services/conversationAccess'
 import {
   availableClientTabbar,
   clientModuleTitle,
@@ -126,6 +127,7 @@ const {
   activeConversationId,
   activeConversation,
   activeMessages,
+  activeTypingText,
   loadingOlderMessages,
   boot,
   startSingleChat,
@@ -136,6 +138,7 @@ const {
   sendAsset,
   recallMessage,
   sendScreenshotNotice,
+  sendTyping,
   editMessage,
   deleteMessage,
   deleteMessages,
@@ -157,6 +160,7 @@ const {
 const friendRequestCount = ref(0)
 const friendRequestCountReady = ref(false)
 let friendRequestTimer = 0
+let friendRequestLoadSequence = 0
 let removeNotificationSoundUnlock: (() => void) | null = null
 
 const railItems = computed<RailItem[]>(() => {
@@ -611,8 +615,10 @@ async function handleUpdateGroupDescription(description: string, notifyAll: bool
 }
 
 async function refreshFriendRequestCount() {
+  const sequence = ++friendRequestLoadSequence
   try {
     const requests = await fetchFriendRequests(props.tenantConfig, props.webSession)
+    if (sequence !== friendRequestLoadSequence) return
     const nextCount = requests.filter((item) => item.direction === 'incoming' && item.status === 1).length
     if (friendRequestCountReady.value && nextCount > friendRequestCount.value) {
       notifyFriendRequest(nextCount)
@@ -656,8 +662,25 @@ function shouldShowBrowserSystemNotification() {
   return document.hidden || !document.hasFocus()
 }
 
+function handleConversationAccessSnapshotChanged(event: Event) {
+  const detail = (event as CustomEvent<{
+    allowed?: boolean
+    refresh?: boolean
+  }>).detail
+  if (detail?.allowed === false) {
+    friendRequestCount.value = 0
+    friendRequestCountReady.value = true
+  }
+  if (detail?.refresh === false) return
+  void refreshFriendRequestCount()
+}
+
 onMounted(() => {
   window.addEventListener('resize', handleWindowResize)
+  window.addEventListener(
+    CONVERSATION_ACCESS_BROWSER_EVENT,
+    handleConversationAccessSnapshotChanged
+  )
   removeNotificationSoundUnlock = installNotificationSoundUnlock()
   void boot().catch((error) => {
     layer.error(error instanceof Error ? error.message : 'IM 初始化失败')
@@ -681,6 +704,10 @@ watchEffect((onCleanup) => {
 
 onBeforeUnmount(() => {
   window.removeEventListener('resize', handleWindowResize)
+  window.removeEventListener(
+    CONVERSATION_ACCESS_BROWSER_EVENT,
+    handleConversationAccessSnapshotChanged
+  )
   window.removeEventListener('pointermove', moveConversationResize)
   window.removeEventListener('pointerup', stopConversationResize)
   window.removeEventListener('pointercancel', stopConversationResize)
@@ -764,6 +791,7 @@ watch(
         :conversations="conversations"
         :message-groups="messageGroups"
         :connection-state="connectionState"
+        :typing-text="activeTypingText"
         :show-info="showInfo"
         :open-search-token="openSearchToken"
         :search-messages="searchActiveMessages"
@@ -779,6 +807,7 @@ watch(
         @send-asset="sendAsset"
         @recall-message="recallMessage"
         @screenshot="sendScreenshotNotice"
+        @typing="sendTyping"
         @edit-message="editMessage"
         @delete-message="deleteMessage"
         @delete-messages="deleteMessages"

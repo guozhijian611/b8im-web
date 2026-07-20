@@ -67,6 +67,7 @@ const props = defineProps<{
   conversations: ImConversation[]
   messageGroups: MessageGroup[]
   connectionState: ImConnectionState
+  typingText: string
   showInfo: boolean
   openSearchToken: number
   searchMessages: (keyword: string, messageType?: number) => Promise<Message[]>
@@ -123,6 +124,7 @@ const emit = defineEmits<{
   'send-asset': [File, 'image' | 'file' | 'voice' | 'video']
   'recall-message': [Message]
   screenshot: []
+  typing: []
   'edit-message': [Message, string]
   'delete-message': [Message, 'self' | 'both']
   'delete-messages': [Message[], 'self' | 'both']
@@ -199,6 +201,7 @@ const FORWARD_FILTER_UNGROUPED = 0
 
 const onlineText = computed(() => {
   if (!props.conversation) return '请选择会话'
+  if (props.typingText) return props.typingText
   if (props.conversation.conversationType === 'group') return '群聊'
   if (props.connectionState === 'connected') return 'IM 已连接'
   if (props.connectionState === 'connecting') return 'IM 连接中'
@@ -441,6 +444,7 @@ function syncMentionPanelFromCaret() {
 function onComposerInput() {
   resizeComposerInput()
   syncMentionPanelFromCaret()
+  if (!isEditing.value && draft.value.trim()) emit('typing')
 }
 
 async function openMentionFromButton() {
