@@ -3444,12 +3444,19 @@ export function useImRuntime(
     if (isCanonicalRealtimeCommand(packet.cmd)) {
       // Canonical Rabbit events are state-changing broadcasts. Missing or
       // malformed event ids and schemas fail closed before any local mutation;
-      // ACK/SYNC and other point-to-point commands are not subject to this gate.
-      const canonicalConversation = packet.cmd === 'conversation_read'
+      // ack_ack/SYNC and other point-to-point responses stay outside this gate.
+      const canonicalConversation =
+        packet.cmd === 'conversation_read' || packet.cmd === 'ack'
         ? conversations.value.find(
             (item) =>
               item.conversationId ===
                 String(packet.data?.conversation_id ?? '').trim()
+          ) ?? null
+        : null
+      const canonicalReceiptMessage = packet.cmd === 'ack' && canonicalConversation
+        ? (messages.value[canonicalConversation.id] ?? []).find(
+            (item) =>
+              item.messageId === String(packet.data?.message_id ?? '').trim()
           ) ?? null
         : null
       if (!isCanonicalRealtimeEventPacketValid(
@@ -3458,6 +3465,16 @@ export function useImRuntime(
         session().user.userId,
         {
           conversation: canonicalConversation,
+          message: canonicalReceiptMessage
+            ? {
+                conversationId: canonicalConversation!.conversationId,
+                messageId: String(canonicalReceiptMessage.messageId ?? '').trim(),
+                messageSeq: Number(canonicalReceiptMessage.messageSeq ?? 0),
+                senderOrganization: canonicalReceiptMessage.senderOrganization,
+                senderUserId: canonicalReceiptMessage.senderUserId,
+                side: canonicalReceiptMessage.side
+              }
+            : null,
           currentAccessSnapshotId: currentAccessSnapshotId()
         }
       )) {

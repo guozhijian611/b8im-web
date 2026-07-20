@@ -8,12 +8,14 @@ const CANONICAL_REALTIME_COMMANDS = [
   'recall',
   'edit',
   'delete',
+  'ack',
   'conversation_read'
 ] as const
 const REALTIME_EVENT_TYPES = {
   push: 'message.created',
   recall: 'message.recalled',
   edit: 'message.edited',
+  ack: 'message.receipt',
   conversation_read: 'conversation.read'
 } as const
 
@@ -44,6 +46,7 @@ export interface ImConversationIdentityContext {
 
 export interface CanonicalRealtimeEventValidationOptions {
   conversation?: ImConversationIdentityContext | null
+  message?: ImMessageEventContext | null
   currentAccessSnapshotId?: unknown
 }
 
@@ -107,8 +110,8 @@ export function isCanonicalRealtimeCommand(value: unknown): value is CanonicalRe
 
 /**
  * Validates canonical Rabbit realtime packets before they are observed or
- * allowed to mutate local state. ACK/SYNC and other point-to-point commands
- * are intentionally outside this contract and do not require an event id.
+ * allowed to mutate local state. Point-to-point ACK responses such as
+ * ack_ack, SYNC, and other request responses stay outside this contract.
  */
 export function isCanonicalRealtimeEventPacketValid(
   packet: RealtimeEventPacketLike,
@@ -149,23 +152,70 @@ export function isCanonicalRealtimeEventPacketValid(
     if (!conversation || conversation.conversationId !== data.conversation_id) {
       return false
     }
-    const hasAccessSnapshot = Object.prototype.hasOwnProperty.call(
+    return hasCanonicalAccessSnapshotForConversation(
       data,
-      'cross_org_access_snapshot_id'
+      organization,
+      conversation,
+      options.currentAccessSnapshotId
     )
-    const isCrossOrgSingle =
-      conversation.conversationType === 'single' &&
-      normalizeImOrganization(conversation.peerOrganization) !== organization
-    if (!isCrossOrgSingle) return !hasAccessSnapshot
+  }
 
-    const snapshotId = data.cross_org_access_snapshot_id
-    const currentSnapshotId = options.currentAccessSnapshotId
-    return (
-      typeof snapshotId === 'string' &&
-      /^[1-9][0-9]{0,19}$/.test(snapshotId) &&
-      typeof currentSnapshotId === 'string' &&
-      /^[1-9][0-9]{0,19}$/.test(currentSnapshotId) &&
-      snapshotId === currentSnapshotId
+  if (packet.cmd === 'ack') {
+    const conversation = options.conversation
+    const message = options.message
+    if (!conversation || !message) return false
+    if (!(
+      data.event_type === REALTIME_EVENT_TYPES.ack &&
+      Number.isSafeInteger(packet.organization) &&
+      Number(packet.organization) > 0 &&
+      Number.isSafeInteger(data.organization) &&
+      String(data.organization) === organization &&
+      typeof data.conversation_id === 'string' &&
+      data.conversation_id.trim() !== '' &&
+      typeof data.message_id === 'string' &&
+      data.message_id.trim() !== '' &&
+      Number.isSafeInteger(data.message_seq) &&
+      Number(data.message_seq) > 0 &&
+      Number.isSafeInteger(data.sender_organization) &&
+      Number(data.sender_organization) > 0 &&
+      typeof data.sender_id === 'string' &&
+      data.sender_id.trim() !== '' &&
+      Number.isSafeInteger(data.user_organization) &&
+      Number(data.user_organization) > 0 &&
+      typeof data.user_id === 'string' &&
+      data.user_id.trim() !== '' &&
+      (data.status === 'delivered' || data.status === 'read') &&
+      typeof data.time === 'string' &&
+      data.time.trim() !== ''
+    )) {
+      return false
+    }
+    if (
+      conversation.conversationId !== data.conversation_id ||
+      message.conversationId !== data.conversation_id ||
+      message.messageId !== data.message_id ||
+      message.messageSeq !== data.message_seq ||
+      !isSameImIdentity(
+        message.senderOrganization,
+        message.senderUserId,
+        data.sender_organization,
+        data.sender_id
+      ) ||
+      classifyReceiptEventDirection(
+        data,
+        organization,
+        userId,
+        conversation,
+        message
+      ) === 'invalid'
+    ) {
+      return false
+    }
+    return hasCanonicalAccessSnapshotForConversation(
+      data,
+      organization,
+      conversation,
+      options.currentAccessSnapshotId
     )
   }
 
@@ -234,6 +284,31 @@ function hasMutationActor(data: Record<string, unknown>) {
     normalizeImOrganization(data.actor_organization) &&
     typeof data.actor_user_id === 'string' &&
     data.actor_user_id.trim() !== ''
+  )
+}
+
+function hasCanonicalAccessSnapshotForConversation(
+  data: Record<string, unknown>,
+  organization: string,
+  conversation: ImConversationIdentityContext,
+  currentAccessSnapshotId: unknown
+): boolean {
+  const hasAccessSnapshot = Object.prototype.hasOwnProperty.call(
+    data,
+    'cross_org_access_snapshot_id'
+  )
+  const isCrossOrgSingle =
+    conversation.conversationType === 'single' &&
+    normalizeImOrganization(conversation.peerOrganization) !== organization
+  if (!isCrossOrgSingle) return !hasAccessSnapshot
+
+  const snapshotId = data.cross_org_access_snapshot_id
+  return (
+    typeof snapshotId === 'string' &&
+    /^[1-9][0-9]{0,19}$/.test(snapshotId) &&
+    typeof currentAccessSnapshotId === 'string' &&
+    /^[1-9][0-9]{0,19}$/.test(currentAccessSnapshotId) &&
+    snapshotId === currentAccessSnapshotId
   )
 }
 
