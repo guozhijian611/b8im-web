@@ -3,11 +3,18 @@ import { isSameImIdentity, normalizeImOrganization } from './imIdentity.ts'
 export const MAX_RECENT_REALTIME_EVENT_IDS = 2048
 export const REALTIME_EVENT_ID_PATTERN = /^[a-f0-9]{64}$/
 
-const CANONICAL_REALTIME_COMMANDS = ['push', 'recall', 'edit', 'delete'] as const
+const CANONICAL_REALTIME_COMMANDS = [
+  'push',
+  'recall',
+  'edit',
+  'delete',
+  'conversation_read'
+] as const
 const REALTIME_EVENT_TYPES = {
   push: 'message.created',
   recall: 'message.recalled',
-  edit: 'message.edited'
+  edit: 'message.edited',
+  conversation_read: 'conversation.read'
 } as const
 
 const STORAGE_PREFIX = 'b8im:web:realtime-events:v1'
@@ -33,6 +40,11 @@ export interface ImConversationIdentityContext {
   conversationType: 'single' | 'group'
   peerOrganization?: unknown
   peerUserId?: unknown
+}
+
+export interface CanonicalRealtimeEventValidationOptions {
+  conversation?: ImConversationIdentityContext | null
+  currentAccessSnapshotId?: unknown
 }
 
 export interface PendingImControlRequest {
@@ -101,13 +113,61 @@ export function isCanonicalRealtimeCommand(value: unknown): value is CanonicalRe
 export function isCanonicalRealtimeEventPacketValid(
   packet: RealtimeEventPacketLike,
   organization: string,
-  userId = ''
+  userId = '',
+  options: CanonicalRealtimeEventValidationOptions = {}
 ): boolean {
   if (!isCanonicalRealtimeCommand(packet.cmd)) return false
   if (String(packet.organization ?? '') !== organization || !isRecord(packet.data)) return false
 
   const data = packet.data
   if (!isValidRealtimeEventId(data.event_id)) return false
+
+  if (packet.cmd === 'conversation_read') {
+    if (!(
+      data.event_type === REALTIME_EVENT_TYPES.conversation_read &&
+      Number.isSafeInteger(packet.organization) &&
+      Number(packet.organization) > 0 &&
+      typeof data.conversation_id === 'string' &&
+      data.conversation_id.trim() !== '' &&
+      typeof data.last_read_message_id === 'string' &&
+      data.last_read_message_id.trim() !== '' &&
+      Number.isSafeInteger(data.last_read_seq) &&
+      Number(data.last_read_seq) > 0 &&
+      Number.isSafeInteger(data.unread_count) &&
+      Number(data.unread_count) >= 0 &&
+      Number.isSafeInteger(data.user_organization) &&
+      Number(data.user_organization) > 0 &&
+      typeof data.user_id === 'string' &&
+      data.user_id.trim() !== '' &&
+      typeof data.time === 'string' &&
+      data.time.trim() !== ''
+    )) {
+      return false
+    }
+
+    const conversation = options.conversation
+    if (!conversation || conversation.conversationId !== data.conversation_id) {
+      return false
+    }
+    const hasAccessSnapshot = Object.prototype.hasOwnProperty.call(
+      data,
+      'cross_org_access_snapshot_id'
+    )
+    const isCrossOrgSingle =
+      conversation.conversationType === 'single' &&
+      normalizeImOrganization(conversation.peerOrganization) !== organization
+    if (!isCrossOrgSingle) return !hasAccessSnapshot
+
+    const snapshotId = data.cross_org_access_snapshot_id
+    const currentSnapshotId = options.currentAccessSnapshotId
+    return (
+      typeof snapshotId === 'string' &&
+      /^[1-9][0-9]{0,19}$/.test(snapshotId) &&
+      typeof currentSnapshotId === 'string' &&
+      /^[1-9][0-9]{0,19}$/.test(currentSnapshotId) &&
+      snapshotId === currentSnapshotId
+    )
+  }
 
   const messageId = String(data.message_id ?? '')
   const conversationId = String(data.conversation_id ?? '')
