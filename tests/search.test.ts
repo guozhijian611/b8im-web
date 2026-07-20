@@ -99,6 +99,9 @@ test('消息搜索结果只接受 canonical 非空发送用户 ID', () => {
     parseSearchHit(row(901, '界'.repeat(21))).senderUserId,
     '界'.repeat(21)
   )
+  for (const value of ['\fidentity\f', '\u00a0identity\u00a0']) {
+    assert.equal(parseSearchHit(row(901, value)).senderUserId, value)
+  }
 })
 
 test('消息搜索固定 DTO 的其余字段缺失或类型错误时失败关闭', () => {

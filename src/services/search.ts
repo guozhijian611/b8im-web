@@ -50,7 +50,8 @@ function canonicalAccessId(value: unknown, field: string): string {
     typeof value !== 'string' ||
     value.length === 0 ||
     utf8Encoder.encode(value).byteLength > 64 ||
-    value.trim() !== value ||
+    value.startsWith(' ') ||
+    value.endsWith(' ') ||
     invalidAccessIdFragments.some((fragment) => value.includes(fragment))
   ) {
     throw new TypeError(`消息搜索结果 ${field} 无效`)
