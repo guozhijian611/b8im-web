@@ -9,7 +9,7 @@ import { fetchI18nLocales, fetchI18nMessages, type I18nLocaleItem } from '../ser
 import { createMoment, fetchMomentsFeed, toggleMomentLike, type MomentsPost } from '../services/moments'
 import { modulePageError } from '../services/modulePageError'
 import { fetchRobots, matchRobotReply, type RobotSingleItem } from '../services/robotSingle'
-import { searchMessagesFull, type SearchHit } from '../services/search'
+import { searchMessagesFull, searchSenderLabel, type SearchHit } from '../services/search'
 import { fetchStickerItems, fetchStickerPacks, type StickerItem, type StickerPack } from '../services/sticker'
 import type { ClientModuleKey } from '../services/clientModules'
 import type { TenantBrandConfig } from '../services/tenantConfig'
@@ -211,7 +211,7 @@ onMounted(load)
         <section class="module-grid"><article v-for="folder in folders" :key="`f-${folder.id}`"><strong>📁 {{ folder.name }}</strong><small>{{ folder.createTime }}</small></article><article v-for="item in files" :key="`i-${item.id}`"><strong>{{ item.name }}</strong><p>{{ item.kind }} · {{ (item.sizeBytes / 1024).toFixed(1) }} KB</p></article></section>
       </template>
 
-      <section v-else-if="moduleKey === 'search'" class="module-list"><article v-for="item in searchHits" :key="item.messageId"><div><strong>{{ item.senderUserId }}</strong><p>{{ item.content }}</p><small>{{ item.sentAt || item.conversationId }}</small></div></article></section>
+      <section v-else-if="moduleKey === 'search'" class="module-list"><article v-for="item in searchHits" :key="item.messageId"><div><strong>{{ searchSenderLabel(item) }}</strong><p>{{ item.content }}</p><small>{{ item.sentAt || item.conversationId }}</small></div></article></section>
 
       <section v-else-if="moduleKey === 'moments'" class="module-list"><article v-for="item in moments" :key="item.id"><div><strong>{{ item.userId }}</strong><p>{{ item.content }}</p><small>{{ item.createTime }} · {{ item.commentCount }} 条评论</small></div><button @click="likeMoment(item)">{{ item.liked ? '已赞' : '点赞' }} {{ item.likeCount }}</button></article></section>
 
