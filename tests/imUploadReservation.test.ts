@@ -147,6 +147,18 @@ function groupAccess(): CommittedGroupAccessSnapshot {
   return { snapshotId: '1', entries: new Map([[conversationId, entry]]) }
 }
 
+function assertExactPrepareBody(body: Record<string, unknown>) {
+  assert.match(String(body.idempotency_key), /^[0-9a-f]{32}$/)
+  assert.deepEqual(body, {
+    idempotency_key: body.idempotency_key,
+    kind: 'file',
+    filename: file.name,
+    size: file.size,
+    mime_type: file.type
+  })
+  assert.equal('conversation_type' in body, false)
+}
+
 test('prepare payload rejects invalid proxy path, upload id, and expiration', async () => {
   const originalWindow = globalThis.window
   const originalFetch = globalThis.fetch
@@ -196,7 +208,7 @@ test('prepare payload rejects invalid proxy path, upload id, and expiration', as
   }
 })
 
-test('prepare sends one secure idempotency key and upload multipart sends only upload_id metadata', async () => {
+test('single upload options keep prepare at the exact five-key DTO and upload multipart sends only upload_id metadata', async () => {
   const originalWindow = globalThis.window
   const originalFetch = globalThis.fetch
   const originalXhr = globalThis.XMLHttpRequest
@@ -212,15 +224,11 @@ test('prepare sends one secure idempotency key and upload multipart sends only u
   }
 
   try {
-    const asset = await uploadImAsset(config, session, file, 'file')
-    assert.match(String(prepareBody.idempotency_key), /^[0-9a-f]{32}$/)
-    assert.deepEqual(Object.keys(prepareBody).sort(), [
-      'filename',
-      'idempotency_key',
-      'kind',
-      'mime_type',
-      'size'
-    ])
+    const asset = await uploadImAsset(config, session, file, 'file', {
+      conversationType: 'single',
+      conversationId: 'single_upload_reservation'
+    })
+    assertExactPrepareBody(prepareBody)
     const body = xhr.latest()?.sentBody
     assert.ok(body instanceof FormData)
     assert.deepEqual(Array.from(body.keys()).sort(), ['file', 'upload_id'])
@@ -358,6 +366,7 @@ test('group access cancellation aborts upload and releases through a fresh reque
       '/saimulti/web/im/prepareUpload',
       '/saimulti/web/im/releaseUpload'
     ])
+    assertExactPrepareBody(calls[0].body)
     assert.deepEqual(calls[1].body, { upload_id: uploadId })
     assert.equal(calls[1].signal?.aborted, false)
   } finally {

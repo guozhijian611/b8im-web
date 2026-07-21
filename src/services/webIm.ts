@@ -1516,8 +1516,7 @@ export async function uploadImAsset(
         kind,
         filename: intent.filename,
         size: intent.size,
-        mime_type: intent.mimeType,
-        conversation_type: options.conversationType
+        mime_type: intent.mimeType
       }
     })
     uploadId = preparedUploadId(preparedPayload)
