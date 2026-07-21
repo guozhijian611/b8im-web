@@ -181,11 +181,21 @@ interface CachedAssetUrl {
 interface PrepareUploadPayload {
   mode: 'proxy'
   method: 'POST'
-  upload_path: string
-  filename?: string
-  size?: number
-  mime_type?: string
-  extension?: string
+  upload_path: '/saimulti/web/im/upload'
+  upload_id: string
+  expires_at: number
+  filename: string
+  size: number
+  mime_type: string
+  extension: string
+}
+
+interface UploadIntent {
+  kind: UploadedAsset['kind']
+  filename: string
+  size: number
+  mimeType: string
+  extension: string
 }
 
 export interface MessageConfig {
@@ -215,7 +225,77 @@ interface FriendRequestPayload {
 const WINDOW_STORAGE_KEY = 'b8im_web_window_session'
 const LOCAL_RESOURCE_HOSTS = new Set(['127.0.0.1', 'localhost', '::1', '[::1]'])
 const PRIVATE_ASSET_CACHE_SKEW_SECONDS = 30
+const UPLOAD_RESERVATION_CLOCK_SKEW_SECONDS = 30
+const UPLOAD_ID_PATTERN = /^[0-9a-f]{64}$/
+const UPLOAD_IDEMPOTENCY_KEY_PATTERN = /^[0-9a-f]{32}$/
 const privateAssetUrlCache = new Map<string, CachedAssetUrl>()
+
+function createUploadIdempotencyKey() {
+  const cryptoApi = globalThis.crypto
+  if (typeof cryptoApi?.randomUUID === 'function') {
+    const value = cryptoApi.randomUUID().replace(/-/g, '').toLowerCase()
+    if (UPLOAD_IDEMPOTENCY_KEY_PATTERN.test(value)) return value
+  }
+  if (typeof cryptoApi?.getRandomValues !== 'function') {
+    throw new Error('当前运行时不支持安全随机数，无法准备上传')
+  }
+  const bytes = new Uint8Array(16)
+  cryptoApi.getRandomValues(bytes)
+  return Array.from(bytes, (value) => value.toString(16).padStart(2, '0')).join('')
+}
+
+function preparedUploadId(payload: unknown): string | null {
+  if (!payload || typeof payload !== 'object') return null
+  const uploadId = (payload as Record<string, unknown>).upload_id
+  return typeof uploadId === 'string' && UPLOAD_ID_PATTERN.test(uploadId)
+    ? uploadId
+    : null
+}
+
+function createUploadIntent(file: File, kind: UploadedAsset['kind']): UploadIntent {
+  const filename = file.name.trim()
+  if (
+    !filename ||
+    Array.from(filename).length > 255 ||
+    /[\u0000-\u001F\u007F]/u.test(filename)
+  ) {
+    throw new Error('文件名无效')
+  }
+  const rawMimeType = file.type.trim()
+  if (rawMimeType.length > 255 || /[\u0000-\u001F\u007F]/.test(rawMimeType)) {
+    throw new Error('文件 MIME 无效')
+  }
+  const mimeType = rawMimeType || 'application/octet-stream'
+  const separator = filename.lastIndexOf('.')
+  const extension = separator >= 0 ? filename.slice(separator + 1).toLowerCase() : ''
+  return { kind, filename, size: file.size, mimeType, extension }
+}
+
+function parsePrepareUploadPayload(
+  payload: unknown,
+  intent: UploadIntent
+): PrepareUploadPayload {
+  if (!payload || typeof payload !== 'object') throw new Error('上传准备响应格式无效')
+  const data = payload as Record<string, unknown>
+  const uploadId = preparedUploadId(data)
+  const expiresAt = data.expires_at
+  if (
+    data.mode !== 'proxy' ||
+    data.method !== 'POST' ||
+    data.upload_path !== '/saimulti/web/im/upload' ||
+    !uploadId ||
+    typeof expiresAt !== 'number' ||
+    !Number.isSafeInteger(expiresAt) ||
+    expiresAt <= Math.floor(Date.now() / 1000) + UPLOAD_RESERVATION_CLOCK_SKEW_SECONDS ||
+    data.filename !== intent.filename ||
+    data.size !== intent.size ||
+    data.mime_type !== intent.mimeType ||
+    data.extension !== intent.extension
+  ) {
+    throw new Error('上传准备响应格式无效')
+  }
+  return data as unknown as PrepareUploadPayload
+}
 
 function isCrossOrgAccessFailClosed(session: WebImSession) {
   return isConversationAccessRecoveryRequired(
@@ -1419,36 +1499,55 @@ export async function uploadImAsset(
     onProgress?: UploadProgressHandler
   } = {}
 ): Promise<UploadedAsset> {
+  const intent = createUploadIntent(file, kind)
   const groupTask = options.conversationType === 'group'
     ? startGroupAccessTask(session, options.conversationId, true)
     : null
+  let uploadId: string | null = null
+  let confirmed = false
   try {
     options.onProgress?.(3)
-    const prepared = await requestWebApi<PrepareUploadPayload>(config, '/saimulti/web/im/prepareUpload', {
+    const preparedPayload = await requestWebApi<unknown>(config, '/saimulti/web/im/prepareUpload', {
       method: 'POST',
       token: session.accessToken,
       signal: groupTask?.signal,
       body: {
+        idempotency_key: createUploadIdempotencyKey(),
         kind,
-        filename: file.name,
-        size: file.size,
-        mime_type: file.type,
+        filename: intent.filename,
+        size: intent.size,
+        mime_type: intent.mimeType,
         conversation_type: options.conversationType
       }
     })
+    uploadId = preparedUploadId(preparedPayload)
+    const prepared = parsePrepareUploadPayload(preparedPayload, intent)
     groupTask?.assertCurrent()
     options.onProgress?.(8)
 
-    if (
-      prepared.mode === 'proxy' &&
-      prepared.method === 'POST' &&
-      prepared.upload_path === '/saimulti/web/im/upload'
-    ) {
-      return await uploadImAssetByProxy(
-        config, session, file, kind, options.onProgress, groupTask
-      )
+    return await uploadImAssetByProxy(
+      config,
+      session,
+      file,
+      intent,
+      prepared.upload_id,
+      options.onProgress,
+      groupTask,
+      () => { confirmed = true }
+    )
+  } catch (error) {
+    if (uploadId && !confirmed) {
+      try {
+        await requestWebApi<unknown>(config, '/saimulti/web/im/releaseUpload', {
+          method: 'POST',
+          token: session.accessToken,
+          body: { upload_id: uploadId }
+        })
+      } catch {
+        // Best-effort cleanup must preserve the original upload failure.
+      }
     }
-    throw new Error('上传模式无效')
+    throw error
   } finally {
     groupTask?.finish()
   }
@@ -1458,23 +1557,26 @@ async function uploadImAssetByProxy(
   config: TenantBrandConfig,
   session: WebImSession,
   file: File,
-  kind: UploadedAsset['kind'],
+  intent: UploadIntent,
+  uploadId: string,
   onProgress?: UploadProgressHandler,
-  groupTask: GroupAccessTask | null = null
+  groupTask: GroupAccessTask | null = null,
+  onConfirmed: () => void = () => undefined
 ): Promise<UploadedAsset> {
   const form = new FormData()
-  form.set('file', file)
-  form.set('kind', kind)
+  form.set('file', file, intent.filename)
+  form.set('upload_id', uploadId)
   const data = await requestWebApiWithUpload<UploadedAssetPayload>(config, '/saimulti/web/im/upload', {
     token: session.accessToken,
     body: form,
     onProgress,
+    onServerAccepted: onConfirmed,
     signal: groupTask?.signal
   })
 
   groupTask?.assertCurrent()
   onProgress?.(100)
-  const asset = mapUploadedAsset(data, file)
+  const asset = mapUploadedAsset(data, intent)
   return asset
 }
 
@@ -1511,11 +1613,7 @@ export async function deriveForwardAsset(
       }
     })
     groupTask?.assertCurrent()
-    const asset = mapUploadedAsset(data, {
-      name: '',
-      size: 0,
-      type: ''
-    })
+    const asset = mapUploadedAsset(data)
     if (asset.kind !== source.kind) throw new Error('派生附件类型与原消息不一致')
     return asset
   } finally {
@@ -1593,19 +1691,47 @@ export async function resolveImAssetUrl(
 
 function mapUploadedAsset(
   data: UploadedAssetPayload,
-  file: Pick<File, 'name' | 'size' | 'type'>
+  expected?: UploadIntent
 ): UploadedAsset {
   const fileId = String(data.file_id ?? '')
   if (!/^[a-f0-9]{40}$/.test(fileId)) throw new Error('上传响应缺少可信 file_id')
+  const kind = data.kind
+  const name = data.name
+  const size = data.size
+  const mimeType = data.mime_type
+  const extension = data.extension
+  if (
+    !['image', 'file', 'voice', 'video'].includes(kind) ||
+    typeof name !== 'string' ||
+    name.length === 0 ||
+    !Number.isSafeInteger(size) ||
+    size <= 0 ||
+    typeof mimeType !== 'string' ||
+    typeof extension !== 'string'
+  ) {
+    throw new Error('上传响应元数据无效')
+  }
+  if (
+    expected &&
+    (
+      kind !== expected.kind ||
+      name !== expected.filename ||
+      size !== expected.size ||
+      mimeType !== expected.mimeType ||
+      extension !== expected.extension
+    )
+  ) {
+    throw new Error('上传响应与预留意图不一致')
+  }
 
   return {
     fileId,
-    kind: data.kind,
-    name: String(data.name ?? file.name),
+    kind,
+    name,
     url: '',
-    size: Number(data.size ?? file.size),
-    mimeType: String(data.mime_type ?? file.type),
-    extension: String(data.extension ?? '')
+    size,
+    mimeType,
+    extension
   }
 }
 

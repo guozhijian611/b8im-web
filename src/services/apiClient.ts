@@ -35,6 +35,7 @@ export interface WebApiUploadOptions {
   token?: string
   query?: WebApiOptions['query']
   onProgress?: (progress: number) => void
+  onServerAccepted?: () => void
   traceContext?: TraceContext
   signal?: AbortSignal
 }
@@ -350,6 +351,7 @@ export function requestWebApiWithUpload<T>(
         finish(() => reject(new WebApiError(payload.message || `请求失败：${xhr.status}`, xhr.status, payload.code)))
         return
       }
+      options.onServerAccepted?.()
       if (accessEpoch && !isConversationAccessEpochCurrent(accessEpoch)) {
         uploadSpan?.fail({
           code: 'HTTP_ACCESS_EPOCH_CHANGED',
