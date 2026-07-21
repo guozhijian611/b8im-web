@@ -1,10 +1,21 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, inject, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { Plus, RefreshCw, Search, Trash2 } from '@lucide/vue'
 import StatePanel from './StatePanel.vue'
 import { createCsConversation, fetchMyCsConversations, type CustomerServiceConversation } from '../services/customerService'
 import { createFavorite, deleteFavorites, fetchFavorites, type FavoriteItem } from '../services/favorite'
-import { createFileMediaFolder, fetchFileMediaFolders, fetchFileMediaItems, fetchFileMediaUsage, type FileMediaFolder, type FileMediaItem, type FileMediaQuota } from '../services/fileMedia'
+import {
+  createFileMediaFolder,
+  fetchFileMediaFolders,
+  fetchFileMediaItems,
+  fetchFileMediaUsage,
+  formatFileMediaByteCount,
+  formatFileMediaQuotaByteCount,
+  formatFileMediaUsageRatio,
+  type FileMediaFolder,
+  type FileMediaItem,
+  type FileMediaUsage
+} from '../services/fileMedia'
 import { fetchI18nLocales, fetchI18nMessages, type I18nLocaleItem } from '../services/i18n'
 import { createMoment, fetchMomentsFeed, toggleMomentLike, type MomentsPost } from '../services/moments'
 import { modulePageError } from '../services/modulePageError'
@@ -15,6 +26,15 @@ import type { ClientModuleKey } from '../services/clientModules'
 import type { TenantBrandConfig } from '../services/tenantConfig'
 import type { WebImSession } from '../types'
 import { GROUP_ACCESS_BROWSER_EVENT } from '../services/groupMemberAccess'
+import {
+  createModuleWorkbenchLoadCoordinator,
+  createModuleWorkbenchLoadSnapshot,
+  isModuleWorkbenchLoadContextCurrent,
+  MODULE_WORKBENCH_LOAD_DEPENDENCIES_KEY,
+  type ModuleWorkbenchLoadDependencies,
+  type ModuleWorkbenchLoadInput,
+  type ModuleWorkbenchLoadResult
+} from './moduleWorkbenchLoad'
 
 const props = defineProps<{
   moduleKey: Exclude<ClientModuleKey, 'announcement'>
@@ -38,11 +58,41 @@ const stickerItems = ref<StickerItem[]>([])
 const conversations = ref<CustomerServiceConversation[]>([])
 const robots = ref<RobotSingleItem[]>([])
 const robotReply = ref('')
-const quota = ref<FileMediaQuota | null>(null)
+const fileMediaUsage = ref<FileMediaUsage | null>(null)
 const folders = ref<FileMediaFolder[]>([])
 const files = ref<FileMediaItem[]>([])
 const searchHits = ref<SearchHit[]>([])
 const moments = ref<MomentsPost[]>([])
+const defaultLoadDependencies: ModuleWorkbenchLoadDependencies = {
+  fetchI18nLocales,
+  fetchI18nMessages,
+  fetchFavorites,
+  fetchStickerPacks,
+  fetchStickerItems,
+  fetchMyCsConversations,
+  fetchRobots,
+  fetchFileMediaUsage,
+  fetchFileMediaFolders,
+  fetchFileMediaItems,
+  fetchMomentsFeed
+}
+const loadCoordinator = createModuleWorkbenchLoadCoordinator(
+  inject<ModuleWorkbenchLoadDependencies | null>(
+    MODULE_WORKBENCH_LOAD_DEPENDENCIES_KEY,
+    null
+  ) ??
+    defaultLoadDependencies
+)
+let selectionGeneration = 0
+
+function currentLoadInput(): ModuleWorkbenchLoadInput {
+  return {
+    moduleKey: props.moduleKey,
+    title: props.title,
+    tenantConfig: props.tenantConfig,
+    webSession: props.webSession
+  }
+}
 
 const empty = computed(() => {
   if (props.moduleKey === 'i18n') return locales.value.length === 0
@@ -55,59 +105,124 @@ const empty = computed(() => {
   return moments.value.length === 0
 })
 
-function handleError(value: unknown, fallback: string) {
-  const result = modulePageError(value, props.moduleKey, fallback)
+function handleError(
+  value: unknown,
+  fallback: string,
+  moduleKey: Exclude<ClientModuleKey, 'announcement'> = props.moduleKey
+) {
+  const result = modulePageError(value, moduleKey, fallback)
   forbidden.value = result.forbidden
   error.value = result.message
 }
 
-async function load() {
-  loading.value = true
-  forbidden.value = false
-  error.value = ''
-  try {
-    if (props.moduleKey === 'i18n') {
-      locales.value = await fetchI18nLocales(props.tenantConfig, props.webSession)
-      const first = locales.value.find((item) => item.isDefault) ?? locales.value[0]
-      if (first) await selectLocale(first.code)
-    } else if (props.moduleKey === 'favorite') {
-      favorites.value = (await fetchFavorites(props.tenantConfig, props.webSession)).items
-    } else if (props.moduleKey === 'sticker') {
-      stickerPacks.value = await fetchStickerPacks(props.tenantConfig, props.webSession)
-      const first = stickerPacks.value[0]
-      if (first) await selectStickerPack(first.id)
-    } else if (props.moduleKey === 'customer_service') {
-      conversations.value = (await fetchMyCsConversations(props.tenantConfig, props.webSession)).items
-    } else if (props.moduleKey === 'robot_single') {
-      robots.value = (await fetchRobots(props.tenantConfig, props.webSession)).items
-      selectedId.value = robots.value[0]?.id ?? 0
-    } else if (props.moduleKey === 'file_media') {
-      const [usage, folderList, itemList] = await Promise.all([
-        fetchFileMediaUsage(props.tenantConfig, props.webSession),
-        fetchFileMediaFolders(props.tenantConfig, props.webSession),
-        fetchFileMediaItems(props.tenantConfig, props.webSession)
-      ])
-      quota.value = usage
-      folders.value = folderList
-      files.value = itemList
-    } else if (props.moduleKey === 'moments') {
-      moments.value = (await fetchMomentsFeed(props.tenantConfig, props.webSession)).items
-    }
-  } catch (value) {
-    handleError(value, `${props.title}加载失败`)
-  } finally {
-    loading.value = false
+function commitLoadResult(result: ModuleWorkbenchLoadResult) {
+  switch (result.moduleKey) {
+    case 'i18n':
+      locales.value = result.locales
+      localeMessages.value = result.localeMessages
+      selectedId.value = result.selectedId
+      break
+    case 'favorite':
+      favorites.value = result.favorites
+      break
+    case 'sticker':
+      stickerPacks.value = result.stickerPacks
+      stickerItems.value = result.stickerItems
+      selectedId.value = result.selectedId
+      break
+    case 'customer_service':
+      conversations.value = result.conversations
+      break
+    case 'robot_single':
+      robots.value = result.robots
+      selectedId.value = result.selectedId
+      break
+    case 'file_media':
+      fileMediaUsage.value = result.fileMediaUsage
+      folders.value = result.folders
+      files.value = result.files
+      break
+    case 'moments':
+      moments.value = result.moments
+      break
+    case 'search':
+      break
   }
 }
 
+async function load() {
+  selectionGeneration += 1
+  await loadCoordinator.run(
+    currentLoadInput(),
+    {
+      isContextCurrent(snapshot) {
+        return isModuleWorkbenchLoadContextCurrent(snapshot, currentLoadInput())
+      },
+      onStart() {
+        loading.value = true
+        forbidden.value = false
+        error.value = ''
+      },
+      onSuccess(result) {
+        commitLoadResult(result)
+      },
+      onError(value, snapshot) {
+        handleError(value, `${snapshot.title}加载失败`, snapshot.moduleKey)
+      },
+      onFinish() {
+        loading.value = false
+      }
+    }
+  )
+}
+
 async function selectLocale(code: string) {
-  selectedId.value = locales.value.findIndex((item) => item.code === code) + 1
-  localeMessages.value = (await fetchI18nMessages(props.tenantConfig, props.webSession, code)).messages
+  const snapshot = createModuleWorkbenchLoadSnapshot(currentLoadInput())
+  if (snapshot.moduleKey !== 'i18n') return
+  const token = ++selectionGeneration
+  const nextSelectedId = locales.value.findIndex((item) => item.code === code) + 1
+  try {
+    const messages = await fetchI18nMessages(snapshot.tenantConfig, snapshot.webSession, code)
+    if (
+      token !== selectionGeneration ||
+      !isModuleWorkbenchLoadContextCurrent(snapshot, currentLoadInput())
+    ) {
+      return
+    }
+    selectedId.value = nextSelectedId
+    localeMessages.value = messages.messages
+  } catch (value) {
+    if (
+      token === selectionGeneration &&
+      isModuleWorkbenchLoadContextCurrent(snapshot, currentLoadInput())
+    ) {
+      handleError(value, `${snapshot.title}词条加载失败`, snapshot.moduleKey)
+    }
+  }
 }
 
 async function selectStickerPack(id: number) {
-  selectedId.value = id
-  stickerItems.value = await fetchStickerItems(props.tenantConfig, props.webSession, id)
+  const snapshot = createModuleWorkbenchLoadSnapshot(currentLoadInput())
+  if (snapshot.moduleKey !== 'sticker') return
+  const token = ++selectionGeneration
+  try {
+    const items = await fetchStickerItems(snapshot.tenantConfig, snapshot.webSession, id)
+    if (
+      token !== selectionGeneration ||
+      !isModuleWorkbenchLoadContextCurrent(snapshot, currentLoadInput())
+    ) {
+      return
+    }
+    selectedId.value = id
+    stickerItems.value = items
+  } catch (value) {
+    if (
+      token === selectionGeneration &&
+      isModuleWorkbenchLoadContextCurrent(snapshot, currentLoadInput())
+    ) {
+      handleError(value, `${snapshot.title}内容加载失败`, snapshot.moduleKey)
+    }
+  }
 }
 
 async function submit() {
@@ -162,7 +277,11 @@ async function likeMoment(item: MomentsPost) {
   }
 }
 
-watch(() => props.moduleKey, load)
+watch(
+  () => [props.moduleKey, props.title, props.tenantConfig, props.webSession],
+  () => void load(),
+  { deep: true }
+)
 function clearAccessControlledSearch() {
   searchHits.value = []
 }
@@ -171,6 +290,8 @@ onMounted(() => {
   void load()
 })
 onBeforeUnmount(() => {
+  selectionGeneration += 1
+  loadCoordinator.dispose()
   window.removeEventListener(GROUP_ACCESS_BROWSER_EVENT, clearAccessControlledSearch)
 })
 </script>
@@ -217,8 +338,31 @@ onBeforeUnmount(() => {
       </section>
 
       <template v-else-if="moduleKey === 'file_media'">
-        <section v-if="quota" class="module-stats"><article><strong>{{ quota.usedFileCount }}</strong><span>文件数</span></article><article><strong>{{ (quota.usedStorageBytes / 1048576).toFixed(1) }} MB</strong><span>已用空间</span></article><article><strong>{{ Math.round(quota.usageRatio * 100) }}%</strong><span>使用率</span></article></section>
-        <section class="module-grid"><article v-for="folder in folders" :key="`f-${folder.id}`"><strong>📁 {{ folder.name }}</strong><small>{{ folder.createTime }}</small></article><article v-for="item in files" :key="`i-${item.id}`"><strong>{{ item.name }}</strong><p>{{ item.kind }} · {{ (item.sizeBytes / 1024).toFixed(1) }} KB</p></article></section>
+        <section v-if="fileMediaUsage" class="file-media-sources">
+          <section class="file-media-source">
+            <header><strong>中央存储容量</strong><small>来源：usage.storage / StorageQuota</small></header>
+            <div class="module-stats file-media-stats">
+              <article><strong>{{ formatFileMediaQuotaByteCount(fileMediaUsage.storage.quota_value, fileMediaUsage.storage.unlimited) }}</strong><span>容量上限</span></article>
+              <article><strong>{{ formatFileMediaByteCount(fileMediaUsage.storage.used_value) }}</strong><span>已确认用量</span></article>
+              <article><strong>{{ formatFileMediaByteCount(fileMediaUsage.storage.held_value) }}</strong><span>上传预留</span></article>
+              <article><strong>{{ formatFileMediaByteCount(fileMediaUsage.storage.occupancy_value) }}</strong><span>当前占用</span></article>
+              <article><strong>{{ fileMediaUsage.storage.remaining_value === null ? '无限' : formatFileMediaByteCount(fileMediaUsage.storage.remaining_value) }}</strong><span>剩余容量</span></article>
+              <article><strong>{{ formatFileMediaUsageRatio(fileMediaUsage.storage.usage_ratio) }}</strong><span>占用率</span></article>
+              <article><strong>{{ fileMediaUsage.storage.used_file_count }}</strong><span>已确认文件</span></article>
+              <article><strong>{{ fileMediaUsage.storage.held_file_count }}</strong><span>预留文件</span></article>
+            </div>
+          </section>
+          <section class="file-media-source">
+            <header><strong>file_media 模块策略</strong><small>来源：usage.policy</small></header>
+            <div class="module-stats file-media-stats">
+              <article><strong>{{ formatFileMediaByteCount(fileMediaUsage.policy.max_file_bytes) }}</strong><span>单文件上限</span></article>
+              <article><strong>{{ fileMediaUsage.policy.large_file_enabled === 1 ? '开启' : '关闭' }}</strong><span>大文件</span></article>
+              <article><strong>{{ fileMediaUsage.policy.preview_enabled === 1 ? '开启' : '关闭' }}</strong><span>预览</span></article>
+              <article><strong>{{ fileMediaUsage.policy.status === 1 ? '启用' : '停用' }}</strong><span>模块状态</span></article>
+            </div>
+          </section>
+        </section>
+        <section class="module-grid"><article v-for="folder in folders" :key="'f-' + folder.id"><strong>📁 {{ folder.name }}</strong><small>{{ folder.createTime }}</small></article><article v-for="item in files" :key="'i-' + item.id"><strong>{{ item.name }}</strong><p>{{ item.kind }} · {{ formatFileMediaByteCount(String(item.sizeBytes)) }}</p></article></section>
       </template>
 
       <section v-else-if="moduleKey === 'search'" class="module-list"><article v-for="item in searchHits" :key="item.messageId"><div><strong>{{ searchSenderLabel(item) }}</strong><p>{{ item.content }}</p><small>{{ item.conversationType === 'group' ? '群聊' : '单聊' }} · {{ item.sentAt || '时间未知' }} · {{ item.conversationId }}</small></div></article></section>
@@ -232,4 +376,5 @@ onBeforeUnmount(() => {
 
 <style scoped>
 .module-page{flex:1;min-width:0;overflow:auto;background:var(--surface-soft,#f6f8fa);padding:32px}.module-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:24px}.module-header span,.module-header p,small{color:#718096}.module-header h1{margin:5px 0;font-size:26px}.module-header button,.module-form button,.module-list button{display:inline-flex;align-items:center;gap:6px;border:0;border-radius:10px;padding:10px 15px;background:#20bf6b;color:#fff;cursor:pointer}.module-form{display:flex;gap:10px;margin-bottom:20px}.module-form input,.module-form select{min-width:0;border:1px solid #dce2e8;border-radius:10px;padding:11px 13px;background:#fff}.module-form input{flex:1}.module-list,.module-grid{display:grid;gap:12px}.module-grid{grid-template-columns:repeat(auto-fill,minmax(180px,1fr))}.module-list article,.module-grid article,.module-stats article{display:flex;justify-content:space-between;gap:16px;border:1px solid #e6ebef;border-radius:14px;background:#fff;padding:16px}.module-list p,.module-grid p{margin:7px 0;color:#465466;white-space:pre-wrap}.module-list .danger{background:#fff;color:#dc3545;border:1px solid #f2c8ce}.module-list .highlight{border-color:#a6e9c5;background:#effcf5}.module-split{display:grid;grid-template-columns:220px 1fr;gap:16px}.module-split nav{display:flex;flex-direction:column;gap:8px}.module-split nav button{display:flex;flex-direction:column;text-align:left;border:1px solid #e6ebef;border-radius:12px;background:#fff;padding:12px;cursor:pointer}.module-stats{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:16px}.module-stats article{flex-direction:column}.module-stats strong{font-size:22px}@media(max-width:760px){.module-page{padding:18px}.module-split{grid-template-columns:1fr}.module-form{flex-wrap:wrap}.module-stats{grid-template-columns:1fr}}
+.file-media-sources{display:grid;gap:16px;margin-bottom:16px}.file-media-source{border:1px solid #dfe6ec;border-radius:16px;background:#f9fbfc;padding:16px}.file-media-source>header{display:flex;align-items:center;justify-content:space-between;gap:12px}.file-media-source>header strong{font-size:17px}.file-media-source .file-media-stats{grid-template-columns:repeat(auto-fit,minmax(150px,1fr));margin:14px 0 0}.file-media-source .file-media-stats strong{font-size:18px;overflow-wrap:anywhere}@media(max-width:760px){.file-media-source>header{align-items:flex-start;flex-direction:column}}
 </style>
