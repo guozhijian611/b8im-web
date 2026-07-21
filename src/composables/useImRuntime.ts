@@ -3963,7 +3963,8 @@ export function useImRuntime(
       if (!isFriendRequestRealtimeEventPacketValid(
         packet,
         session().organization,
-        session().user.userId
+        session().user.userId,
+        session().crossOrgAccessSnapshotId
       )) {
         failSocketAuthentication(
           current,
@@ -4651,17 +4652,22 @@ export function useImRuntime(
   }
 
   function handleFriendRequestEvent(data: Record<string, any>) {
-    if (data.event !== 'created') {
-      return
-    }
-
     onFriendRequestEvent?.({
-      event: 'created',
-      requestId: Number(data.request_id ?? 0),
-      pendingCount: Number(data.pending_count ?? 0),
-      fromUser: data.from_user ? mapWebImUser(data.from_user) : null,
-      message: String(data.message ?? ''),
-      createTime: String(data.create_time ?? '')
+      event: data.event as FriendRequestPushEvent['event'],
+      eventId: String(data.event_id),
+      requestId: Number(data.request_id),
+      status: data.status as FriendRequestPushEvent['status'],
+      fromOrganization: String(data.from_organization),
+      fromUserId: String(data.from_user_id),
+      toOrganization: String(data.to_organization),
+      toUserId: String(data.to_user_id),
+      targetOrganization: String(data.target_organization),
+      targetUserId: String(data.target_user_id),
+      actorOrganization: String(data.actor_organization),
+      actorUserId: String(data.actor_user_id),
+      crossOrgAccessSnapshotId: data.cross_org_access_snapshot_id as string | null,
+      createTime: String(data.create_time),
+      handleTime: data.handle_time as string | null
     })
   }
 

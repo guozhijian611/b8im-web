@@ -47,9 +47,16 @@ import {
   setTitleNotifierBaseTitle,
   setTitleNotifierUnreadCount
 } from '../services/titleNotifier'
-import { fetchFriendRequests, fetchGroupMembers, updateWebAvatar, uploadImAsset } from '../services/webIm'
+import {
+  fetchContacts,
+  fetchFriendRequests,
+  fetchGroupMembers,
+  updateWebAvatar,
+  uploadImAsset
+} from '../services/webIm'
 import type {
   Contact,
+  FriendRequest,
   FriendRequestPushEvent,
   GroupMember,
   LockScreenSettings,
@@ -158,9 +165,17 @@ const {
 )
 
 const friendRequestCount = ref(0)
-const friendRequestCountReady = ref(false)
+const friendContacts = ref<Contact[]>([])
+const friendRequests = ref<FriendRequest[]>([])
+const friendStateLoading = ref(false)
+const friendStateError = ref('')
 let friendRequestTimer = 0
-let friendRequestLoadSequence = 0
+let friendStateRefreshPromise: Promise<void> | null = null
+let friendStateRefreshQueued = false
+let friendRequestNotificationVersion = 0
+let pendingCreatedNotification: { version: number; baseline: number } | null = null
+let lastNotifiedFriendRequestCount = 0
+let friendStateAuthoritativeReady = false
 let removeNotificationSoundUnlock: (() => void) | null = null
 
 const railItems = computed<RailItem[]>(() => {
@@ -615,32 +630,103 @@ async function handleUpdateGroupDescription(description: string, notifyAll: bool
   }
 }
 
-async function refreshFriendRequestCount() {
-  const sequence = ++friendRequestLoadSequence
-  try {
-    const requests = await fetchFriendRequests(props.tenantConfig, props.webSession)
-    if (sequence !== friendRequestLoadSequence) return
-    const nextCount = requests.filter((item) => item.direction === 'incoming' && item.status === 1).length
-    if (friendRequestCountReady.value && nextCount > friendRequestCount.value) {
-      notifyFriendRequest(nextCount)
+function refreshFriendState(): Promise<void> {
+  friendStateRefreshQueued = true
+  if (friendStateRefreshPromise) return friendStateRefreshPromise
+
+  const refresh = async () => {
+    friendStateLoading.value = true
+    try {
+      while (friendStateRefreshQueued) {
+        friendStateRefreshQueued = false
+        const createdNotification = pendingCreatedNotification
+        const scope = friendRequestScope()
+        friendStateError.value = ''
+        try {
+          const [contacts, requests] = await Promise.all([
+            fetchContacts(props.tenantConfig, props.webSession),
+            fetchFriendRequests(props.tenantConfig, props.webSession)
+          ])
+          if (scope !== friendRequestScope()) {
+            friendStateRefreshQueued = true
+            continue
+          }
+          const nextCount = requests.filter(
+            (item) => item.direction === 'incoming' && item.status === 1
+          ).length
+          const previousCount = friendRequestCount.value
+          const shouldNotifyCreated = Boolean(
+            createdNotification &&
+            nextCount > createdNotification.baseline &&
+            nextCount > lastNotifiedFriendRequestCount
+          )
+          const shouldNotifyPolling = Boolean(
+            !pendingCreatedNotification &&
+            friendStateAuthoritativeReady &&
+            nextCount > previousCount &&
+            nextCount > lastNotifiedFriendRequestCount
+          )
+          const hasNewerCreatedNotification = Boolean(
+            pendingCreatedNotification &&
+            pendingCreatedNotification.version !== createdNotification?.version
+          )
+          if (shouldNotifyCreated || shouldNotifyPolling) {
+            notifyFriendRequest(nextCount)
+            lastNotifiedFriendRequestCount = nextCount
+          } else if (!friendStateAuthoritativeReady && !hasNewerCreatedNotification) {
+            lastNotifiedFriendRequestCount = nextCount
+          } else if (nextCount < lastNotifiedFriendRequestCount) {
+            lastNotifiedFriendRequestCount = nextCount
+          }
+          if (pendingCreatedNotification?.version === createdNotification?.version) {
+            pendingCreatedNotification = null
+          }
+
+          // 联系人与好友申请是同一个权威快照；两次读取均成功后才一起提交。
+          friendContacts.value = contacts
+          friendRequests.value = requests
+          friendRequestCount.value = nextCount
+          friendStateAuthoritativeReady = true
+        } catch (error) {
+          if (scope !== friendRequestScope()) {
+            friendStateRefreshQueued = true
+            continue
+          }
+          friendStateError.value = error instanceof Error ? error.message : '好友关系刷新失败'
+          // 权威读取失败时保留整份既有快照；后续实时事件或轮询会串行重试。
+        }
+      }
+    } finally {
+      friendStateLoading.value = false
     }
-    friendRequestCount.value = nextCount
-    friendRequestCountReady.value = true
-  } catch {
-    // 好友申请角标失败不影响主聊天链路。
   }
+
+  friendStateRefreshPromise = refresh().finally(() => {
+    friendStateRefreshPromise = null
+    if (friendStateRefreshQueued) void refreshFriendState()
+  })
+  return friendStateRefreshPromise
 }
 
-function handleFriendRequestCountUpdate(count: number) {
-  friendRequestCount.value = count
-  friendRequestCountReady.value = true
+function friendRequestScope() {
+  return [
+    props.webSession.organization,
+    props.webSession.user.userId,
+    props.webSession.accessToken
+  ].join('\u0000')
 }
 
 function handleRealtimeFriendRequest(event: FriendRequestPushEvent) {
-  const nextCount = Math.max(friendRequestCount.value + 1, event.pendingCount || 0)
-  friendRequestCount.value = nextCount
-  friendRequestCountReady.value = true
-  notifyFriendRequest(nextCount, event.fromUser?.nickname)
+  if (event.event === 'created') {
+    pendingCreatedNotification = {
+      version: ++friendRequestNotificationVersion,
+      baseline: Math.min(
+        pendingCreatedNotification?.baseline ?? friendRequestCount.value,
+        friendRequestCount.value
+      )
+    }
+  }
+  void refreshFriendState()
 }
 
 function notifyFriendRequest(count: number, fromName = '') {
@@ -667,13 +753,41 @@ function handleConversationAccessSnapshotChanged(event: Event) {
   const detail = (event as CustomEvent<{
     allowed?: boolean
     refresh?: boolean
+    organization?: string
+    userId?: string
   }>).detail
   if (detail?.allowed === false) {
-    friendRequestCount.value = 0
-    friendRequestCountReady.value = true
+    const organization = String(detail.organization ?? '')
+    const userId = String(detail.userId ?? '')
+    const contacts = organization && userId
+      ? friendContacts.value.filter(
+        (contact) => contact.organization !== organization || contact.userId !== userId
+      )
+      : friendContacts.value.filter(
+        (contact) => contact.organization === props.webSession.organization
+      )
+    const requests = organization && userId
+      ? friendRequests.value.filter((request) => {
+        const fromMatches = request.fromOrganization === organization &&
+          (!request.fromUser || request.fromUser.userId === userId)
+        const toMatches = request.toOrganization === organization &&
+          (!request.toUser || request.toUser.userId === userId)
+        return !fromMatches && !toMatches
+      })
+      : friendRequests.value.filter((request) =>
+        request.fromOrganization === props.webSession.organization &&
+        request.toOrganization === props.webSession.organization
+      )
+    const nextCount = requests.filter(
+      (request) => request.direction === 'incoming' && request.status === 1
+    ).length
+    friendContacts.value = contacts
+    friendRequests.value = requests
+    friendRequestCount.value = nextCount
+    pendingCreatedNotification = null
   }
   if (detail?.refresh === false) return
-  void refreshFriendRequestCount()
+  void refreshFriendState()
 }
 
 onMounted(() => {
@@ -686,8 +800,8 @@ onMounted(() => {
   void boot().catch((error) => {
     layer.error(error instanceof Error ? error.message : 'IM 初始化失败')
   })
-  void refreshFriendRequestCount()
-  friendRequestTimer = window.setInterval(refreshFriendRequestCount, 20000)
+  void refreshFriendState()
+  friendRequestTimer = window.setInterval(refreshFriendState, 20000)
 })
 
 watchEffect((onCleanup) => {
@@ -722,6 +836,20 @@ watch(
   () => `${props.webSession.organization}:${props.webSession.user.userId}:${props.webSession.user.account}`,
   () => refreshLockScreenSettings(),
   { immediate: true }
+)
+
+watch(
+  () => friendRequestScope(),
+  () => {
+    pendingCreatedNotification = null
+    lastNotifiedFriendRequestCount = 0
+    friendContacts.value = []
+    friendRequests.value = []
+    friendRequestCount.value = 0
+    friendStateAuthoritativeReady = false
+    friendStateError.value = ''
+    void refreshFriendState()
+  }
 )
 
 watch(
@@ -834,9 +962,13 @@ watch(
       <ContactsView
         :tenant-config="tenantConfig"
         :web-session="webSession"
+        :contacts="friendContacts"
+        :friend-requests="friendRequests"
+        :friend-state-loading="friendStateLoading"
+        :friend-state-error="friendStateError"
+        :refresh-friend-state="refreshFriendState"
         @start-chat="handleStartChat"
         @create-group="handleCreateGroup"
-        @update-request-count="handleFriendRequestCountUpdate"
       />
     </template>
 

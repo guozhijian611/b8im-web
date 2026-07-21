@@ -233,12 +233,21 @@ export interface FriendRequest {
 }
 
 export interface FriendRequestPushEvent {
-  event: 'created'
+  event: 'created' | 'accepted' | 'rejected'
+  eventId: string
   requestId: number
-  pendingCount: number
-  fromUser: WebImUser | null
-  message: string
+  status: 1 | 2 | 3
+  fromOrganization: string
+  fromUserId: string
+  toOrganization: string
+  toUserId: string
+  targetOrganization: string
+  targetUserId: string
+  actorOrganization: string
+  actorUserId: string
+  crossOrgAccessSnapshotId: string | null
   createTime: string
+  handleTime: string | null
 }
 
 export interface Message {
