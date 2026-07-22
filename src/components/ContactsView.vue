@@ -2,8 +2,6 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { Check, MessageCircle, Phone, Search, UserPlus, Video, X } from '@lucide/vue'
 import {
-  fetchContacts,
-  fetchFriendRequests,
   handleFriendRequest,
   searchUsers,
   sendFriendRequest,
@@ -18,17 +16,23 @@ import type { Contact, FriendRequest, WebImSession, WebImUser } from '../types'
 const props = defineProps<{
   tenantConfig: TenantBrandConfig
   webSession: WebImSession
+  contacts: Contact[]
+  friendRequests: FriendRequest[]
+  friendStateLoading: boolean
+  friendStateError: string
+  refreshFriendState: () => Promise<void>
 }>()
 
 const emit = defineEmits<{
   'start-chat': [Contact]
   'create-group': [string, Contact[]]
-  'update-request-count': [number]
 }>()
 
 const activeMode = ref<'friends' | 'requests' | 'add' | 'group'>('friends')
-const contacts = ref<Contact[]>([])
-const requests = ref<FriendRequest[]>([])
+const contacts = computed(() => props.contacts)
+const requests = computed(() => props.friendRequests)
+const loading = computed(() => props.friendStateLoading)
+const errorMessage = computed(() => props.friendStateError)
 const searchResults = ref<WebImUser[]>([])
 const activeContact = ref<Contact | null>(null)
 const keyword = ref('')
@@ -36,11 +40,7 @@ const userKeyword = ref('')
 const requestMessage = ref('我是 ' + props.webSession.user.nickname)
 const groupTitle = ref('')
 const selectedGroupUserIds = ref<string[]>([])
-const loading = ref(false)
 const searching = ref(false)
-const errorMessage = ref('')
-let contactsLoadSequence = 0
-let requestsLoadSequence = 0
 let searchSequence = 0
 let accessSearchRefreshTimer = 0
 
@@ -80,43 +80,6 @@ function userIdentity(user: Pick<WebImUser, 'organization' | 'userId'>) {
   return imIdentityKey(user.organization, user.userId)
 }
 
-async function loadContacts() {
-  const sequence = ++contactsLoadSequence
-  loading.value = true
-  errorMessage.value = ''
-  try {
-    const loaded = await fetchContacts(props.tenantConfig, props.webSession)
-    if (sequence !== contactsLoadSequence) return
-    contacts.value = loaded
-    activeContact.value = contacts.value[0] ?? null
-  } catch (error) {
-    if (sequence !== contactsLoadSequence) return
-    errorMessage.value = error instanceof Error ? error.message : '联系人加载失败'
-    contacts.value = []
-    activeContact.value = null
-  } finally {
-    if (sequence === contactsLoadSequence) loading.value = false
-  }
-}
-
-async function loadRequests() {
-  const sequence = ++requestsLoadSequence
-  loading.value = true
-  errorMessage.value = ''
-  try {
-    const loaded = await fetchFriendRequests(props.tenantConfig, props.webSession)
-    if (sequence !== requestsLoadSequence) return
-    requests.value = loaded
-    emit('update-request-count', incomingPendingRequests.value.length)
-  } catch (error) {
-    if (sequence !== requestsLoadSequence) return
-    errorMessage.value = error instanceof Error ? error.message : '好友申请加载失败'
-    layer.error(errorMessage.value)
-  } finally {
-    if (sequence === requestsLoadSequence) loading.value = false
-  }
-}
-
 async function submitSearch() {
   const sequence = ++searchSequence
   const value = userKeyword.value.trim()
@@ -150,8 +113,7 @@ async function addFriend(user: WebImUser) {
     )
     layer.success(result.message)
     await submitSearch()
-    await loadContacts()
-    await loadRequests()
+    await props.refreshFriendState()
   } catch (error) {
     layer.error(error instanceof Error ? error.message : '好友申请发送失败')
   }
@@ -161,8 +123,7 @@ async function resolveRequest(request: FriendRequest, action: 'accept' | 'reject
   try {
     await handleFriendRequest(props.tenantConfig, props.webSession, request, action)
     layer.success(action === 'accept' ? '已通过好友申请' : '已拒绝好友申请')
-    await loadRequests()
-    await loadContacts()
+    await props.refreshFriendState()
   } catch (error) {
     layer.error(error instanceof Error ? error.message : '处理失败')
   }
@@ -180,7 +141,7 @@ async function editRemark(contact: Contact) {
       remark.trim()
     )
     layer.success('好友备注已更新')
-    await loadContacts()
+    await props.refreshFriendState()
   } catch (error) {
     layer.error(error instanceof Error ? error.message : '备注更新失败')
   }
@@ -188,7 +149,7 @@ async function editRemark(contact: Contact) {
 
 function switchMode(mode: 'friends' | 'requests' | 'add' | 'group') {
   activeMode.value = mode
-  if (mode === 'requests') loadRequests()
+  if (mode === 'requests') void props.refreshFriendState()
 }
 
 function submitGroup() {
@@ -235,9 +196,6 @@ function handleConversationAccessChanged(event: Event) {
   searching.value = false
   if (detail?.allowed === false && organization && userId) {
     const identity = imIdentityKey(organization, userId)
-    contacts.value = contacts.value.filter(
-      (contact) => contactIdentity(contact) !== identity
-    )
     searchResults.value = searchResults.value.filter(
       (user) => userIdentity(user) !== identity
     )
@@ -245,40 +203,28 @@ function handleConversationAccessChanged(event: Event) {
       (selected) => selected !== identity
     )
     if (activeContact.value && contactIdentity(activeContact.value) === identity) {
-      activeContact.value = contacts.value[0] ?? null
+      activeContact.value = contacts.value.find(
+        (contact) => contactIdentity(contact) !== identity
+      ) ?? null
     }
-    requests.value = requests.value.filter((request) => {
-      const fromMatches = request.fromOrganization === organization &&
-        (!request.fromUser || request.fromUser.userId === userId)
-      const toMatches = request.toOrganization === organization &&
-        (!request.toUser || request.toUser.userId === userId)
-      return !fromMatches && !toMatches
-    })
     searchResults.value = searchResults.value.filter(
       (user) => user.organization === props.webSession.organization
     )
-    emit('update-request-count', incomingPendingRequests.value.length)
   } else if (detail?.allowed === false) {
-    contacts.value = contacts.value.filter(
-      (contact) => contact.organization === props.webSession.organization
-    )
     searchResults.value = searchResults.value.filter(
       (user) => user.organization === props.webSession.organization
     )
     selectedGroupUserIds.value = selectedGroupUserIds.value.filter(
       (identity) => identity.startsWith(`${props.webSession.organization}:`)
     )
-    requests.value = requests.value.filter((request) =>
-      request.fromOrganization === props.webSession.organization &&
-      request.toOrganization === props.webSession.organization
-    )
     if (
       activeContact.value &&
       activeContact.value.organization !== props.webSession.organization
     ) {
-      activeContact.value = contacts.value[0] ?? null
+      activeContact.value = contacts.value.find(
+        (contact) => contact.organization === props.webSession.organization
+      ) ?? null
     }
-    emit('update-request-count', incomingPendingRequests.value.length)
   }
   if (detail?.refresh === false) {
     window.clearTimeout(accessSearchRefreshTimer)
@@ -289,7 +235,7 @@ function handleConversationAccessChanged(event: Event) {
     }
     return
   }
-  void Promise.allSettled([loadContacts(), loadRequests()]).then(() => {
+  void props.refreshFriendState().then(() => {
     if (userKeyword.value.trim()) {
       void submitSearch()
     } else {
@@ -299,13 +245,11 @@ function handleConversationAccessChanged(event: Event) {
   })
 }
 
-onMounted(async () => {
+onMounted(() => {
   window.addEventListener(
     CONVERSATION_ACCESS_BROWSER_EVENT,
     handleConversationAccessChanged
   )
-  await loadContacts()
-  await loadRequests()
 })
 
 onBeforeUnmount(() => {
@@ -317,11 +261,14 @@ onBeforeUnmount(() => {
 })
 
 watch(
-  () => props.webSession.accessToken,
-  async () => {
-    await loadContacts()
-    await loadRequests()
-  }
+  () => props.contacts,
+  (loadedContacts) => {
+    const activeIdentity = activeContact.value ? contactIdentity(activeContact.value) : ''
+    activeContact.value = loadedContacts.find(
+      (contact) => contactIdentity(contact) === activeIdentity
+    ) ?? loadedContacts[0] ?? null
+  },
+  { immediate: true }
 )
 </script>
 

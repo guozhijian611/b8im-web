@@ -1,4 +1,5 @@
 import { isSameImIdentity, normalizeImOrganization } from './imIdentity.ts'
+import { canonicalAccessId, normalizePositiveDecimal } from './groupMemberAccess.ts'
 
 export const MAX_RECENT_REALTIME_EVENT_IDS = 2048
 export const REALTIME_EVENT_ID_PATTERN = /^[a-f0-9]{64}$/
@@ -774,33 +775,112 @@ export function reusablePendingScreenshotClientMsgId(
 export function isFriendRequestRealtimeEventPacketValid(
   packet: RealtimeEventPacketLike,
   organization: string,
-  userId: string
+  userId: string,
+  currentAccessSnapshotId: unknown
 ): boolean {
   if (packet.cmd !== 'friend_request') return false
-  if (String(packet.organization ?? '') !== organization || !isRecord(packet.data)) return false
-
-  const data = packet.data
-  if (!isValidRealtimeEventId(data.event_id) || data.event !== 'created') return false
-  if (!Number.isSafeInteger(data.request_id) || Number(data.request_id) <= 0) return false
-  if (!Number.isSafeInteger(data.pending_count) || Number(data.pending_count) < 0) return false
-  if (typeof data.from_user_id !== 'string' || data.from_user_id.trim() === '') return false
-  if (!normalizeImOrganization(data.from_organization)) return false
-  if (String(data.to_organization ?? '') !== organization) return false
-  if (typeof data.to_user_id !== 'string' || data.to_user_id !== userId) return false
-  if (typeof data.message !== 'string' || typeof data.create_time !== 'string' || data.create_time.trim() === '') {
+  if (
+    !Number.isSafeInteger(packet.organization) ||
+    Number(packet.organization) <= 0 ||
+    String(packet.organization) !== organization ||
+    !isRecord(packet.data)
+  ) {
     return false
   }
 
-  if (data.from_user === null || data.from_user === undefined) return true
-  return (
-    isRecord(data.from_user) &&
-    isSameImIdentity(
-      data.from_user.organization,
-      data.from_user.user_id,
-      data.from_organization,
-      data.from_user_id
-    )
-  )
+  const data = packet.data
+  const fields = [
+    'actor_organization',
+    'actor_user_id',
+    'create_time',
+    'cross_org_access_snapshot_id',
+    'event',
+    'event_id',
+    'from_organization',
+    'from_user_id',
+    'handle_time',
+    'request_id',
+    'status',
+    'target_organization',
+    'target_user_id',
+    'to_organization',
+    'to_user_id'
+  ]
+  const keys = Object.keys(data).sort()
+  if (keys.length !== fields.length || keys.some((key, index) => key !== fields[index])) {
+    return false
+  }
+
+  if (!isValidRealtimeEventId(data.event_id)) return false
+  if (data.event !== 'created' && data.event !== 'accepted' && data.event !== 'rejected') {
+    return false
+  }
+  if (!Number.isSafeInteger(data.request_id) || Number(data.request_id) <= 0) return false
+
+  const fromOrganization = canonicalFriendOrganization(data.from_organization)
+  const toOrganization = canonicalFriendOrganization(data.to_organization)
+  const targetOrganization = canonicalFriendOrganization(data.target_organization)
+  const actorOrganization = canonicalFriendOrganization(data.actor_organization)
+  const fromUserId = canonicalAccessId(data.from_user_id)
+  const toUserId = canonicalAccessId(data.to_user_id)
+  const targetUserId = canonicalAccessId(data.target_user_id)
+  const actorUserId = canonicalAccessId(data.actor_user_id)
+  if (
+    !fromOrganization ||
+    !toOrganization ||
+    !targetOrganization ||
+    !actorOrganization ||
+    !fromUserId ||
+    !toUserId ||
+    !targetUserId ||
+    !actorUserId ||
+    isSameImIdentity(fromOrganization, fromUserId, toOrganization, toUserId) ||
+    !isSameImIdentity(targetOrganization, targetUserId, organization, userId)
+  ) {
+    return false
+  }
+
+  const created = data.event === 'created'
+  const expectedStatus = created ? 1 : data.event === 'accepted' ? 2 : 3
+  if (!Number.isSafeInteger(data.status) || data.status !== expectedStatus) return false
+  if (!isCanonicalSqlDateTime(data.create_time)) return false
+  if (created ? data.handle_time !== null : !isCanonicalSqlDateTime(data.handle_time)) {
+    return false
+  }
+  if (
+    created
+      ? !isSameImIdentity(targetOrganization, targetUserId, toOrganization, toUserId) ||
+        !isSameImIdentity(actorOrganization, actorUserId, fromOrganization, fromUserId)
+      : !isSameImIdentity(targetOrganization, targetUserId, fromOrganization, fromUserId) ||
+        !isSameImIdentity(actorOrganization, actorUserId, toOrganization, toUserId)
+  ) {
+    return false
+  }
+
+  if (fromOrganization === toOrganization) {
+    return data.cross_org_access_snapshot_id === null
+  }
+  const snapshotId = normalizePositiveDecimal(data.cross_org_access_snapshot_id)
+  return snapshotId !== '' && snapshotId === normalizePositiveDecimal(currentAccessSnapshotId)
+}
+
+function canonicalFriendOrganization(value: unknown): string {
+  return typeof value === 'string' && normalizeImOrganization(value) === value ? value : ''
+}
+
+function isCanonicalSqlDateTime(value: unknown): value is string {
+  if (typeof value !== 'string') return false
+  const match = /^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})$/.exec(value)
+  if (!match) return false
+  const [year, month, day, hour, minute, second] = match.slice(1).map(Number)
+  if (year < 1000 || hour > 23 || minute > 59 || second > 59) return false
+  const parsed = new Date(Date.UTC(year, month - 1, day, hour, minute, second))
+  return parsed.getUTCFullYear() === year &&
+    parsed.getUTCMonth() === month - 1 &&
+    parsed.getUTCDate() === day &&
+    parsed.getUTCHours() === hour &&
+    parsed.getUTCMinutes() === minute &&
+    parsed.getUTCSeconds() === second
 }
 
 export function browserSessionStorage(): RealtimeEventStorage | null {

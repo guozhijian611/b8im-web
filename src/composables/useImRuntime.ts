@@ -40,10 +40,32 @@ import {
 import type { ConversationAccessEpochToken } from '../services/conversationAccess'
 import type { TenantBrandConfig } from '../services/tenantConfig'
 import { activeServiceCandidate, promoteServiceCandidate } from '../services/routing'
-import { notifyTitleIncomingMessage } from '../services/titleNotifier'
+import { notifyTitleIncomingMessage, stopTitleScroll } from '../services/titleNotifier'
 import { formatImMessageTime, formatImTime, parseImTimestamp } from '../services/time'
 import { attachTraceContext, PendingSendTraceRegistry } from '../services/imTelemetry'
 import { isSameImIdentity, normalizeImOrganization } from '../services/imIdentity'
+import {
+  classifyGroupAccessEvent,
+  compareCanonicalDecimals,
+  GroupAccessFrameBarrier,
+  GROUP_ACCESS_BROWSER_EVENT,
+  GROUP_ACCESS_CHANGED_COMMAND,
+  GROUP_ACCESS_SNAPSHOT_ACK_COMMAND,
+  GroupAccessSnapshotStaging,
+  GroupAccessSnapshotStore,
+  groupAccessConversationPatch,
+  isGroupAccessReady,
+  isGroupMessageBatchVisible,
+  isGroupMessageVisible,
+  isMessageSequenceVisible,
+  normalizePositiveDecimal,
+  parseGroupAccessChanged,
+  revokedGroupConversationIds,
+  setGroupAccessNotReady,
+  type CommittedGroupAccessSnapshot,
+  type GroupAccessChangedEvent,
+  type GroupAccessEntry
+} from '../services/groupMemberAccess'
 import {
   canRecoverGlobalSyncConversation,
   commitGlobalSyncRecoveryCursor,
@@ -69,6 +91,7 @@ import {
   type TraceContext
 } from '../services/telemetry'
 import {
+  clearPrivateAssetUrlCache,
   createMessageGroup as createMessageGroupApi,
   createGroupConversation,
   createVirtualConversation,
@@ -144,6 +167,7 @@ type ConversationSyncPage = {
   messages_has_more: boolean
   changes_has_more: boolean
   cross_org_access_snapshot_id: string
+  access_snapshot_id: string
   access_snapshot_behind_high_water: boolean
 }
 
@@ -163,6 +187,13 @@ type PendingGlobalSyncRequest = {
   clientMsgId: string
   afterGlobalSeq: string
   resolve: (page: GlobalSyncPage) => void
+  reject: (error: Error) => void
+  timer: number
+}
+
+type PendingGroupAccessPage = {
+  clientMsgId: string
+  resolve: (packet: ImPacket) => void
   reject: (error: Error) => void
   timer: number
 }
@@ -198,6 +229,8 @@ type SerializedForwardItem = {
   }
 }
 
+class GroupAccessSnapshotRestartError extends Error {}
+
 const MESSAGE_TYPE_TEXT = 1
 const MESSAGE_TYPE_IMAGE = 2
 const MESSAGE_TYPE_FILE = 3
@@ -211,6 +244,8 @@ const GLOBAL_SYNC_PAGE_LIMIT = 100
 const GLOBAL_SYNC_MAX_PAGES = 100
 const GLOBAL_SYNC_MAX_RESTARTS = 5
 const AUTH_RECOVERY_BUFFER_LIMIT = 2048
+const GROUP_ACCESS_SNAPSHOT_LIMIT = 100
+const GROUP_ACCESS_MAX_PAGES = 1000
 const DELIVERY_STATE_RANK: Record<'sent' | 'delivered' | 'read', number> = {
   sent: 1,
   delivered: 2,
@@ -607,6 +642,7 @@ export function useImRuntime(
   const pendingConversationSyncRequests =
     new Map<string, PendingConversationSyncRequest>()
   const pendingGlobalSyncRequests = new Map<string, PendingGlobalSyncRequest>()
+  let pendingGroupAccessPage: PendingGroupAccessPage | null = null
   const pendingScreenshotRequests = new Map<string, string>()
   const conversationChangeCursors = new Map<string, number>()
   const messageChangeCursors = new Map<string, number>()
@@ -615,6 +651,8 @@ export function useImRuntime(
   const revokedConversationIds = new Set<string>()
   const restorableConversationIds = new Set<string>()
   const typingTimers = new Map<string, number>()
+  const notificationsByConversation = new Map<string, Set<Notification>>()
+  const notificationToastsByConversation = new Map<string, Set<number>>()
   const lastTypingSentAt = new Map<string, number>()
   const loadingOlderMessages = ref(false)
   const messageDeleteConfig = ref({
@@ -639,6 +677,13 @@ export function useImRuntime(
   let crossOrgAccessRecoveryRequired = false
   let authenticatedRecoverySequence = 0
   let authenticatedRecoveryPackets: ImPacket[] = []
+  let bufferedGroupAccessPackets: ImPacket[] = []
+  let groupAccessStore: GroupAccessSnapshotStore | null = null
+  let groupAccessStoreScope = ''
+  let groupAccessStaging: GroupAccessSnapshotStaging | null = null
+  let groupAccessFrameBarrier: GroupAccessFrameBarrier | null = null
+  let groupAccessGeneration = 0
+  const processedGroupAccessEventIds = new Set<string>()
   let authenticatedAccessSnapshotBehindHighWater = false
   let authenticatedStaleAccessSnapshotId = ''
   let accessSnapshotRebuild: {
@@ -686,6 +731,125 @@ export function useImRuntime(
     return currentConversationAccessSnapshot(
       session().organization,
       session().user.userId
+    )
+  }
+
+  function groupSnapshotStore() {
+    const organization = session().organization
+    const userId = session().user.userId
+    const scope = `${organization}\u0000${userId}`
+    if (!groupAccessStore || groupAccessStoreScope !== scope) {
+      groupAccessStore = new GroupAccessSnapshotStore(organization, userId)
+      groupAccessStoreScope = scope
+    }
+    return groupAccessStore
+  }
+
+  function committedGroupSnapshot() {
+    return groupSnapshotStore().read()
+  }
+
+  function currentGroupSnapshotId() {
+    return committedGroupSnapshot()?.snapshotId ?? ''
+  }
+
+  function groupAccessEntry(conversation: ImConversation) {
+    return conversation.conversationType === 'group'
+      ? committedGroupSnapshot()?.entries.get(conversation.conversationId) ?? null
+      : null
+  }
+
+  function canUseGroupConversation(conversation: ImConversation, write = false) {
+    if (conversation.conversationType !== 'group') return true
+    if (!isGroupAccessReady(session().organization, session().user.userId)) return false
+    const entry = groupAccessEntry(conversation)
+    return Boolean(entry && (!write || entry.accessState === 'active'))
+  }
+
+  function failCloseGroupAccess() {
+    groupAccessGeneration += 1
+    setGroupAccessNotReady(session().organization, session().user.userId)
+    groupSnapshotStore().failClose()
+    clearPrivateAssetUrlCache(session())
+    clearGroupAccessNotifications()
+    groupAccessStaging?.discard()
+    groupAccessStaging = null
+    if (pendingGroupAccessPage) {
+      window.clearTimeout(pendingGroupAccessPage.timer)
+      pendingGroupAccessPage.reject(new Error('群访问快照已失效'))
+      pendingGroupAccessPage = null
+    }
+    for (const request of [...pendingConversationSyncRequests.values()]) {
+      rejectConversationSyncRequest(request.clientMsgId, new Error('群访问快照已失效'))
+    }
+    const retained: ImConversation[] = []
+    for (const conversation of conversations.value) {
+      if (conversation.conversationType === 'group') clearConversationRuntime(conversation)
+      else retained.push(conversation)
+    }
+    conversations.value = sortConversations(retained)
+    if (activeConversationId.value && !retained.some((value) => value.id === activeConversationId.value)) {
+      activeConversationId.value = retained[0]?.id ?? ''
+    }
+    window.dispatchEvent(new CustomEvent(GROUP_ACCESS_BROWSER_EVENT))
+  }
+
+  function clearGroupAccessNotifications() {
+    stopTitleScroll()
+    for (const conversation of conversations.value) {
+      if (conversation.conversationType !== 'group') continue
+      for (const notification of notificationsByConversation.get(conversation.conversationId) ?? []) {
+        notification.close()
+      }
+      notificationsByConversation.delete(conversation.conversationId)
+      for (const toastId of notificationToastsByConversation.get(conversation.conversationId) ?? []) {
+        layer.remove(toastId)
+      }
+      notificationToastsByConversation.delete(conversation.conversationId)
+    }
+  }
+
+  function markGroupAccessEventBarrierBlocked() {
+    groupAccessGeneration += 1
+    setGroupAccessNotReady(session().organization, session().user.userId)
+    groupSnapshotStore().failClose()
+    clearPrivateAssetUrlCache(session())
+    clearGroupAccessNotifications()
+    conversations.value = conversations.value.map((conversation) =>
+      conversation.conversationType === 'group'
+        ? { ...conversation, groupAccessBlocked: true }
+        : conversation
+    )
+    window.dispatchEvent(new CustomEvent(GROUP_ACCESS_BROWSER_EVENT))
+  }
+
+  function resetGroupAccessFrameBarrier() {
+    groupAccessFrameBarrier = new GroupAccessFrameBarrier(
+      markGroupAccessEventBarrierBlocked,
+      (remaining) => {
+        if (remaining > 0) {
+          setGroupAccessNotReady(session().organization, session().user.userId)
+          groupSnapshotStore().failClose()
+          return
+        }
+        conversations.value = conversations.value.map((conversation) =>
+          conversation.conversationType === 'group'
+            ? { ...conversation, groupAccessBlocked: false }
+            : conversation
+        )
+      },
+      (error) => {
+        const current = socket
+        if (!current) return
+        failCloseGroupAccess()
+        failSocketAuthentication(
+          current,
+          'group-access:event-reload',
+          error instanceof Error ? error.message : '群访问变更需要重新拉取快照',
+          true
+        )
+        scheduleReconnect()
+      }
     )
   }
 
@@ -914,6 +1078,7 @@ export function useImRuntime(
   }
 
   async function boot() {
+    failCloseGroupAccess()
     const accessObservation = observeAccessSnapshot(
       session().crossOrgAccessSnapshotId
     )
@@ -951,8 +1116,11 @@ export function useImRuntime(
     const loaded = (await fetchConversations(config(), session())).filter(
       (conversation) =>
         !revokedConversationIds.has(conversation.conversationId) &&
-        !(isCrossOrgAccessFailClosed() && isCrossOrgSingle(conversation))
-    )
+        !(isCrossOrgAccessFailClosed() && isCrossOrgSingle(conversation)) &&
+        (conversation.conversationType !== 'group' || canUseGroupConversation(conversation))
+    ).map((conversation) => conversation.conversationType === 'group'
+      ? { ...conversation, ...groupAccessConversationPatch(groupAccessEntry(conversation)!) }
+      : conversation)
     const activeVirtual = activeConversation.value?.virtual ? activeConversation.value : null
     conversations.value =
       activeVirtual && !loaded.some((item) => item.id === activeVirtual.id)
@@ -1004,6 +1172,10 @@ export function useImRuntime(
   }
 
   async function createGroup(title: string, contacts: Contact[]) {
+    if (!isGroupAccessReady(session().organization, session().user.userId)) {
+      layer.warning('群成员访问快照尚未就绪')
+      return null
+    }
     if (contacts.length < 2) {
       layer.warning('群聊至少选择 2 个好友')
       return null
@@ -1025,9 +1197,11 @@ export function useImRuntime(
       title,
       memberIds: contacts.map((contact) => contact.userId)
     })
-    conversations.value = sortConversations([group, ...conversations.value.filter((item) => item.id !== group.id)])
-    activeConversationId.value = group.id
-    messages.value[group.id] = []
+    // A join expands access. Never publish the returned conversation directly;
+    // reconnect and rebuild it from the new authoritative snapshot.
+    failCloseGroupAccess()
+    closeSocket()
+    scheduleReconnect()
     return group
   }
 
@@ -1072,6 +1246,7 @@ export function useImRuntime(
       void loadConversations()
       return
     }
+    if (!canUseGroupConversation(conversation)) return
 
     const currentMessages = messages.value[conversation.id] ?? []
     if (currentMessages.length === 0) {
@@ -1080,13 +1255,17 @@ export function useImRuntime(
     }
 
     const cursor = messageCursors.get(conversation.id) ?? maxLocalMessageSeq(currentMessages)
+    const capturedGroupAccessGeneration = groupAccessGeneration
     const result = await fetchMessages(config(), session(), {
       conversationId: conversation.conversationId,
+      conversationType: conversation.conversationType,
       peerOrganization: conversation.peerOrganization,
       peerUserId: conversation.peerUserId,
       afterSeq: cursor,
       limit: 50
     })
+    if (conversation.conversationType === 'group' &&
+      (capturedGroupAccessGeneration !== groupAccessGeneration || !canUseGroupConversation(conversation))) return
     if (result.messages.length > 0) {
       mergeMessages(conversation, result.messages)
       messageCursors.set(
@@ -1099,13 +1278,18 @@ export function useImRuntime(
   }
 
   async function loadRecentConversation(conversation: ImConversation) {
+    if (!canUseGroupConversation(conversation)) return
+    const capturedGroupAccessGeneration = groupAccessGeneration
     const result = await fetchMessages(config(), session(), {
       conversationId: conversation.conversationId,
+      conversationType: conversation.conversationType,
       peerOrganization: conversation.peerOrganization,
       peerUserId: conversation.peerUserId,
       beforeSeq: 0,
       limit: 50
     })
+    if (conversation.conversationType === 'group' &&
+      (capturedGroupAccessGeneration !== groupAccessGeneration || !canUseGroupConversation(conversation))) return
     if (result.messages.length > 0) {
       let targetConversation = conversation
       if (conversation.virtual) {
@@ -1156,6 +1340,7 @@ export function useImRuntime(
   async function loadOlderActiveMessages() {
     const conversation = activeConversation.value
     if (!conversation || conversation.virtual || loadingOlderMessages.value) return false
+    if (!canUseGroupConversation(conversation)) return false
     if (messageHasMoreBefore.get(conversation.id) === false) return false
 
     const beforeSeq = messageBeforeCursors.get(conversation.id) ?? minLocalMessageSeq(messages.value[conversation.id] ?? [])
@@ -1166,13 +1351,17 @@ export function useImRuntime(
 
     loadingOlderMessages.value = true
     try {
+      const capturedGroupAccessGeneration = groupAccessGeneration
       const result = await fetchMessages(config(), session(), {
         conversationId: conversation.conversationId,
+        conversationType: conversation.conversationType,
         peerOrganization: conversation.peerOrganization,
         peerUserId: conversation.peerUserId,
         beforeSeq,
         limit: 50
       })
+      if (conversation.conversationType === 'group' &&
+        (capturedGroupAccessGeneration !== groupAccessGeneration || !canUseGroupConversation(conversation))) return false
       if (revokedConversationIds.has(conversation.conversationId)) return false
       if (result.messages.length === 0) {
         messageHasMoreBefore.set(conversation.id, false)
@@ -1190,6 +1379,7 @@ export function useImRuntime(
   function connect() {
     clearReconnect()
     closeSocket()
+    resetGroupAccessFrameBarrier()
     const routeCandidate = activeServiceCandidate(config(), 'im')
     const wsUrl = routeCandidate.url
     if (!wsUrl) {
@@ -1348,7 +1538,12 @@ export function useImRuntime(
   async function sendAsset(file: File, kind: UploadedAsset['kind']) {
     const conversation = activeConversation.value
     if (!conversation) return false
+    if (!canUseGroupConversation(conversation, true)) {
+      layer.warning('当前群访问仅允许查看授权历史')
+      return false
+    }
     const accessEpoch = captureAccessEpoch()
+    const capturedGroupAccessGeneration = groupAccessGeneration
     if (isCrossOrgAccessFailClosed() && isCrossOrgSingle(conversation)) {
       layer.warning('当前跨机构访问已关闭')
       return false
@@ -1386,6 +1581,7 @@ export function useImRuntime(
     try {
       uploaded = await uploadImAsset(config(), session(), file, kind, {
         conversationType: conversation.conversationType,
+        conversationId: conversation.conversationId,
         onProgress: (progress) => {
           if (!isConversationAccessEpochCurrent(accessEpoch)) return
           updateLocalMessage(conversation.id, clientMsgId, {
@@ -1395,6 +1591,9 @@ export function useImRuntime(
         }
       })
       assertConversationAccessEpochCurrent(accessEpoch)
+      if (capturedGroupAccessGeneration !== groupAccessGeneration) {
+        throw new Error('上传期间群访问快照已变化')
+      }
     } catch (error) {
       updateLocalMessage(conversation.id, clientMsgId, {
         state: 'failed',
@@ -1478,6 +1677,10 @@ export function useImRuntime(
     localType: Message['type'],
     options: { clientMsgId?: string; appendLocal?: boolean; reply?: MessageQuote | null; mentions?: MessageMention[]; localAsset?: UploadedAsset } = {}
   ) {
+    if (!canUseGroupConversation(conversation, true)) {
+      layer.warning('当前群访问仅允许查看授权历史')
+      return false
+    }
     if (isCrossOrgAccessFailClosed() && isCrossOrgSingle(conversation)) {
       layer.warning('当前跨机构访问已关闭')
       return false
@@ -1572,6 +1775,12 @@ export function useImRuntime(
   }
 
   async function forwardContent(message: Message) {
+    const sourceConversation = conversations.value.find(
+      (value) => value.conversationId === message.conversationId
+    )
+    if (sourceConversation && !canUseGroupConversation(sourceConversation, true)) {
+      throw new Error('仅历史可见的群消息不能转发')
+    }
     if (message.forwardBundle) {
       return {
         messageType: MESSAGE_TYPE_TEXT,
@@ -1596,7 +1805,9 @@ export function useImRuntime(
         conversationId: message.conversationId,
         messageId: message.messageId,
         fileId: message.fileId,
-        kind
+        kind,
+        conversationType: sourceConversation?.conversationType,
+        messageSeq: message.messageSeq
       })
       assertConversationAccessEpochCurrent(accessEpoch)
       const messageType = kind === 'image'
@@ -1738,18 +1949,34 @@ export function useImRuntime(
       throw new Error('附件消息缺少可见性上下文')
     }
     const accessEpoch = captureAccessEpoch()
+    const capturedGroupAccessGeneration = groupAccessGeneration
+    const conversation = conversations.value.find(
+      (value) => value.conversationId === message.conversationId
+    )
+    if (conversation && !canUseGroupConversation(conversation)) {
+      throw new Error('群访问快照尚未就绪')
+    }
+    const requiresScopedProof = needsMessageProof || conversation?.conversationType === 'group'
+    if (requiresScopedProof && (!message.conversationId || !message.messageId)) {
+      throw new Error('附件消息缺少群访问可见性上下文')
+    }
     const url = await resolveImAssetUrl(
       config(),
       session(),
       {
         fileId: message.fileId,
-        ...(needsMessageProof
+        conversationType: conversation?.conversationType,
+        messageSeq: message.messageSeq,
+        ...(requiresScopedProof
           ? { conversationId: message.conversationId, messageId: message.messageId }
           : {})
       },
       force
     )
     assertConversationAccessEpochCurrent(accessEpoch)
+    if (capturedGroupAccessGeneration !== groupAccessGeneration) {
+      throw new Error('附件读取期间群访问快照已变化')
+    }
     if (message.conversationId) {
       updateLocalMessage(message.conversationId, message.id, { url })
     }
@@ -1760,6 +1987,7 @@ export function useImRuntime(
   async function recallMessage(message: Message) {
     const conversation = activeConversation.value
     if (!conversation || !message.messageId || !message.conversationId) return false
+    if (!canUseGroupConversation(conversation, true)) return false
     if (message.side !== 'out') {
       layer.warning('只能撤回自己发送的消息')
       return false
@@ -1786,6 +2014,7 @@ export function useImRuntime(
       layer.warning('请选择已有会话')
       return false
     }
+    if (!canUseGroupConversation(conversation, true)) return false
     if (!socket || socket.readyState !== WebSocket.OPEN || connectionState.value !== 'connected') {
       layer.warning('IM连接未就绪，稍后再试')
       return false
@@ -1822,6 +2051,7 @@ export function useImRuntime(
   function sendTyping() {
     const conversation = activeConversation.value
     if (!conversation || conversation.virtual || !conversation.conversationId) return false
+    if (!canUseGroupConversation(conversation, true)) return false
     if (!socket || socket.readyState !== WebSocket.OPEN || connectionState.value !== 'connected') {
       return false
     }
@@ -1858,6 +2088,8 @@ export function useImRuntime(
 
     const conversationId = String(message.conversationId ?? '').trim()
     if (!conversationId) return false
+    const conversation = conversations.value.find((value) => value.conversationId === conversationId)
+    if (conversation && !canUseGroupConversation(conversation, true)) return false
     const clientMsgId = createClientMsgId()
     const content = { text: value }
     registerPendingControlRequest({
@@ -1902,6 +2134,8 @@ export function useImRuntime(
 
     const conversationId = String(message.conversationId ?? '').trim()
     if (!conversationId) return false
+    const conversation = conversations.value.find((value) => value.conversationId === conversationId)
+    if (conversation && !canUseGroupConversation(conversation, true)) return false
     const clientMsgId = createClientMsgId()
     registerPendingControlRequest({
       command: 'delete',
@@ -1947,6 +2181,10 @@ export function useImRuntime(
   }
 
   function requestGlobalSyncPage(current: WebSocket, afterGlobalSeq: string) {
+    const groupSnapshotId = currentGroupSnapshotId()
+    if (!groupSnapshotId || !isGroupAccessReady(session().organization, session().user.userId)) {
+      return Promise.reject(new Error('群访问快照尚未完成'))
+    }
     return new Promise<GlobalSyncPage>((resolve, reject) => {
       const clientMsgId = createClientMsgId()
       const request: PendingGlobalSyncRequest = {
@@ -1967,6 +2205,7 @@ export function useImRuntime(
         cmd: 'sync',
         client_msg_id: clientMsgId,
         data: {
+          access_snapshot_id: groupSnapshotId,
           after_global_seq: afterGlobalSeq,
           limit: GLOBAL_SYNC_PAGE_LIMIT
         }
@@ -2053,7 +2292,7 @@ export function useImRuntime(
 
   function applyGlobalSyncMessages(batch: StableGlobalSyncBatch) {
     assertConversationAccessEpochCurrent(batch.epoch)
-    const applied: ImPacketMessage[] = []
+    const applicable: Array<{ message: ImPacketMessage; conversation: ImConversation }> = []
     for (const message of batch.messages) {
       const conversation = conversations.value.find(
         (item) => item.conversationId === message.conversation_id
@@ -2084,6 +2323,16 @@ export function useImRuntime(
       )) {
         throw new Error('全局 SYNC 消息复合身份或会话归属无效')
       }
+      const groupEntry = groupAccessEntry(conversation)
+      if (conversation.conversationType === 'group' &&
+        !isGroupMessageVisible(groupEntry, conversation.conversationId, message)) {
+        throw new Error('全局 SYNC 群消息超出成员可见周期')
+      }
+      applicable.push({ message, conversation })
+    }
+    assertConversationAccessEpochCurrent(batch.epoch)
+    const applied: ImPacketMessage[] = []
+    for (const { message, conversation } of applicable) {
       appendPacketMessage(
         conversation,
         message,
@@ -2154,6 +2403,10 @@ export function useImRuntime(
     afterChangeSeq: number
   ) {
     const epoch = captureAccessEpoch()
+    const groupSnapshotId = currentGroupSnapshotId()
+    if (!groupSnapshotId || !canUseGroupConversation(conversation)) {
+      return Promise.reject(new Error('群访问快照尚未完成或会话已失效'))
+    }
     const snapshotId = epoch.snapshotId
     if (!snapshotId) {
       return Promise.reject(new Error('跨机构访问快照尚未建立'))
@@ -2193,6 +2446,10 @@ export function useImRuntime(
         cmd: 'sync',
         client_msg_id: clientMsgId,
         data: {
+          access_snapshot_id: groupSnapshotId,
+          ...(conversation.conversationType === 'group'
+            ? { access_version: groupAccessEntry(conversation)?.accessVersion }
+            : {}),
           conversation_id: conversation.conversationId,
           after_seq: afterSeq,
           after_change_seq: afterChangeSeq,
@@ -2217,6 +2474,7 @@ export function useImRuntime(
     const snapshotId = normalizeAccessSnapshotId(
       data.cross_org_access_snapshot_id
     )
+    const groupSnapshotId = normalizePositiveDecimal(data.access_snapshot_id)
     if (
       data.scope !== 'conversation' ||
       String(data.conversation_id ?? '').trim() !== request.conversationId ||
@@ -2229,6 +2487,7 @@ export function useImRuntime(
       typeof data.messages_has_more !== 'boolean' ||
       typeof data.changes_has_more !== 'boolean' ||
       !snapshotId ||
+      !groupSnapshotId || groupSnapshotId !== currentGroupSnapshotId() ||
       (data.messages_has_more && nextAfterSeq <= request.afterSeq) ||
       (data.changes_has_more &&
         nextAfterChangeSeq <= request.afterChangeSeq)
@@ -2260,6 +2519,11 @@ export function useImRuntime(
       pageMessageIds.add(value.message_id)
       packetMessages.push(value as ImPacketMessage)
     }
+    if (conversation.conversationType === 'group' && !isGroupMessageBatchVisible(
+      groupAccessEntry(conversation),
+      conversation.conversationId,
+      packetMessages
+    )) return null
 
     let mappedMessages: Message[]
     try {
@@ -2336,6 +2600,7 @@ export function useImRuntime(
       messages_has_more: data.messages_has_more,
       changes_has_more: data.changes_has_more,
       cross_org_access_snapshot_id: snapshotId,
+      access_snapshot_id: groupSnapshotId,
       access_snapshot_behind_high_water: false
     }
   }
@@ -2543,6 +2808,7 @@ export function useImRuntime(
       (item) => item.conversationId === conversationId
     )
     if (!conversation || !messageId) return false
+    if (!canUseGroupConversation(conversation, true)) return true
     const conversationCursorKey = mutationCursorKey(conversationId)
     const messageCursorKey = mutationCursorKey(conversationId, messageId)
     const decision = classifyMutationChangeSequence(
@@ -2755,8 +3021,13 @@ export function useImRuntime(
     return true
   }
 
-  function clearConversationRuntime(conversation: ImConversation) {
+  function clearConversationRuntime(
+    conversation: Pick<ImConversation, 'id' | 'conversationId'>
+  ) {
     const conversationId = conversation.conversationId
+    for (const message of messages.value[conversation.id] ?? []) {
+      if (message.url?.startsWith('blob:')) URL.revokeObjectURL(message.url)
+    }
     const nextMessages = { ...messages.value }
     delete nextMessages[conversation.id]
     messages.value = nextMessages
@@ -2779,11 +3050,122 @@ export function useImRuntime(
         )
       }
     }
+    for (const request of [...pendingConversationSyncRequests.values()]) {
+      if (request.conversationId === conversationId) {
+        rejectConversationSyncRequest(request.clientMsgId, new Error('会话访问已失效'))
+      }
+    }
     const nextTyping = { ...typingByConversation.value }
     delete nextTyping[conversationId]
     typingByConversation.value = nextTyping
     window.clearTimeout(typingTimers.get(conversationId) ?? 0)
     typingTimers.delete(conversationId)
+    for (const notification of notificationsByConversation.get(conversationId) ?? []) notification.close()
+    notificationsByConversation.delete(conversationId)
+    for (const toastId of notificationToastsByConversation.get(conversationId) ?? []) layer.remove(toastId)
+    notificationToastsByConversation.delete(conversationId)
+  }
+
+  function applyGroupEntryToRuntime(
+    conversation: ImConversation,
+    entry: GroupAccessEntry,
+    publishSummary = true
+  ) {
+    const currentMessages = messages.value[conversation.id] ?? []
+    const retained = currentMessages.filter((message) =>
+      message.messageSeq && isMessageSequenceVisible(entry, message.messageSeq)
+    )
+    for (const message of currentMessages) {
+      if (!retained.includes(message) && message.url?.startsWith('blob:')) URL.revokeObjectURL(message.url)
+    }
+    messages.value = { ...messages.value, [conversation.id]: retained }
+    const maximum = retained.reduce((value, message) => Math.max(value, Number(message.messageSeq ?? 0)), 0)
+    messageCursors.set(conversation.id, maximum)
+    messageBeforeCursors.delete(conversation.id)
+    messageHasMoreBefore.delete(conversation.id)
+    conversationReadCursors.delete(mutationCursorKey(conversation.conversationId))
+    conversationChangeCursors.delete(mutationCursorKey(conversation.conversationId))
+    for (const key of messageChangeCursors.keys()) {
+      if (key.startsWith(mutationCursorKey(conversation.conversationId))) messageChangeCursors.delete(key)
+    }
+    if (publishSummary) {
+      conversations.value = conversations.value.map((value) =>
+        value.id === conversation.id
+          ? { ...value, ...groupAccessConversationPatch(entry), groupAccessBlocked: false }
+          : value
+      )
+    }
+    if (entry.accessState === 'history_only') {
+      for (const request of [...pendingControlRequests.values()]) {
+        if (request.conversationId === conversation.conversationId) {
+          resolvePendingControlRequest(request.clientMsgId)
+          finishSendTrace(request.clientMsgId, 'IM_GROUP_ACCESS_HISTORY_ONLY')
+        }
+      }
+      for (const request of [...pendingConversationSyncRequests.values()]) {
+        if (request.conversationId === conversation.conversationId) {
+          rejectConversationSyncRequest(request.clientMsgId, new Error('当前群访问仅允许查看授权历史'))
+        }
+      }
+      const nextTyping = { ...typingByConversation.value }
+      delete nextTyping[conversation.conversationId]
+      typingByConversation.value = nextTyping
+      window.clearTimeout(typingTimers.get(conversation.conversationId) ?? 0)
+      typingTimers.delete(conversation.conversationId)
+      for (const notification of notificationsByConversation.get(conversation.conversationId) ?? []) {
+        notification.close()
+      }
+      notificationsByConversation.delete(conversation.conversationId)
+      for (const toastId of notificationToastsByConversation.get(conversation.conversationId) ?? []) {
+        layer.remove(toastId)
+      }
+      notificationToastsByConversation.delete(conversation.conversationId)
+    }
+  }
+
+  async function applyCommittedGroupSnapshot(
+    previous: CommittedGroupAccessSnapshot | null,
+    next: CommittedGroupAccessSnapshot
+  ) {
+    clearPrivateAssetUrlCache(session())
+    const revoked = revokedGroupConversationIds(previous, next)
+    for (const conversationId of revoked) {
+      revokedConversationIds.add(conversationId)
+      clearConversationRuntime(
+        conversations.value.find((value) => value.conversationId === conversationId) ??
+          { id: conversationId, conversationId }
+      )
+    }
+    for (const conversationId of next.entries.keys()) revokedConversationIds.delete(conversationId)
+    for (const conversation of conversations.value) {
+      if (conversation.conversationType !== 'group') continue
+      const entry = next.entries.get(conversation.conversationId)
+      if (!entry) {
+        revokedConversationIds.add(conversation.conversationId)
+        clearConversationRuntime(conversation)
+        continue
+      }
+      applyGroupEntryToRuntime(conversation, entry, false)
+    }
+    const loaded = (await fetchConversations(config(), session())).filter((conversation) =>
+      !revokedConversationIds.has(conversation.conversationId) &&
+      !(isCrossOrgAccessFailClosed() && isCrossOrgSingle(conversation)) &&
+      (conversation.conversationType !== 'group' || next.entries.has(conversation.conversationId))
+    ).map((conversation) => {
+      if (conversation.conversationType !== 'group') return conversation
+      const entry = next.entries.get(conversation.conversationId)
+      if (!entry) throw new Error('群访问快照与会话 registry 映射冲突')
+      return { ...conversation, ...groupAccessConversationPatch(entry), groupAccessBlocked: false }
+    })
+    const activeVirtual = activeConversation.value?.virtual ? activeConversation.value : null
+    const nextRegistry = activeVirtual && !loaded.some((item) => item.id === activeVirtual.id)
+      ? [activeVirtual, ...loaded]
+      : sortConversations(loaded)
+    conversations.value = nextRegistry
+    if (!activeConversationId.value ||
+      !nextRegistry.some((value) => value.id === activeConversationId.value)) {
+      activeConversationId.value = nextRegistry[0]?.id ?? ''
+    }
   }
 
   function clearCrossOrgPendingControlRequests() {
@@ -3316,7 +3698,8 @@ export function useImRuntime(
     if (!clientMsgId || !request) return false
     const page = validateGlobalSyncPage(packet.data, {
       organization: session().organization,
-      afterGlobalSeq: request.afterGlobalSeq
+      afterGlobalSeq: request.afterGlobalSeq,
+      groupAccessSnapshotId: currentGroupSnapshotId()
     })
     if (!page) {
       rejectGlobalSyncRequest(
@@ -3337,6 +3720,130 @@ export function useImRuntime(
     return true
   }
 
+  function requestGroupAccessPage(current: WebSocket, staging: GroupAccessSnapshotStaging) {
+    return new Promise<ImPacket>((resolve, reject) => {
+      const clientMsgId = createClientMsgId()
+      const packet = staging.request(clientMsgId)
+      const request: PendingGroupAccessPage = { clientMsgId, resolve, reject, timer: 0 }
+      request.timer = window.setTimeout(() => {
+        if (pendingGroupAccessPage?.clientMsgId === clientMsgId) pendingGroupAccessPage = null
+        staging.discard()
+        reject(new GroupAccessSnapshotRestartError('群访问快照页响应超时'))
+      }, CONTROL_REQUEST_TIMEOUT_MS)
+      pendingGroupAccessPage = request
+      if (!sendPacketToSocket(current, packet)) {
+        window.clearTimeout(request.timer)
+        pendingGroupAccessPage = null
+        staging.discard()
+        reject(new GroupAccessSnapshotRestartError('群访问快照连接已断开'))
+      }
+    })
+  }
+
+  function handleGroupAccessSnapshotAck(packet: ImPacket) {
+    const request = pendingGroupAccessPage
+    if (!request || packet.client_msg_id !== request.clientMsgId) return false
+    window.clearTimeout(request.timer)
+    pendingGroupAccessPage = null
+    request.resolve(packet)
+    return true
+  }
+
+  function rememberGroupAccessEvent(eventId: string) {
+    processedGroupAccessEventIds.add(eventId)
+    while (processedGroupAccessEventIds.size > 2048) {
+      const oldest = processedGroupAccessEventIds.values().next().value
+      if (typeof oldest !== 'string') break
+      processedGroupAccessEventIds.delete(oldest)
+    }
+  }
+
+  async function applyGroupAccessEvent(event: GroupAccessChangedEvent) {
+    const committed = committedGroupSnapshot()
+    if (!committed) throw new GroupAccessSnapshotRestartError('群访问快照尚未提交')
+    const decision = classifyGroupAccessEvent(committed, event, processedGroupAccessEventIds)
+    if (decision.kind === 'stale' || decision.kind === 'duplicate') {
+      await groupSnapshotStore().commit(committed, () => {})
+      return
+    }
+    if (decision.kind === 'reload') {
+      failCloseGroupAccess()
+      throw new GroupAccessSnapshotRestartError('群访问版本存在缺口或权限扩大')
+    }
+    await groupSnapshotStore().commit(decision.next, async () => {
+      clearPrivateAssetUrlCache(session())
+      const conversation = conversations.value.find(
+        (value) => value.conversationId === event.conversationId
+      )
+      if (!conversation) throw new GroupAccessSnapshotRestartError('群访问事件指向未知会话')
+      if (event.accessState === 'revoked') {
+        revokedConversationIds.add(event.conversationId)
+        clearConversationRuntime(conversation)
+        conversations.value = conversations.value.filter((value) => value.id !== conversation.id)
+        if (activeConversationId.value === conversation.id) {
+          activeConversationId.value = conversations.value[0]?.id ?? ''
+        }
+      } else {
+        const nextEntry = decision.next.entries.get(event.conversationId)
+        if (!nextEntry) throw new GroupAccessSnapshotRestartError('群访问事件状态缺失')
+        applyGroupEntryToRuntime(conversation, nextEntry)
+      }
+    })
+    rememberGroupAccessEvent(event.eventId)
+    window.dispatchEvent(new CustomEvent(GROUP_ACCESS_BROWSER_EVENT))
+  }
+
+  async function validateAndApplyGroupAccessPacket(
+    packet: ImPacket,
+    discardAtOrBelowSnapshotId = ''
+  ) {
+    const event = await parseGroupAccessChanged(
+      packet,
+      session().organization,
+      session().user.userId
+    )
+    if (!event) throw new Error('群成员访问变更事件协议无效')
+    if (discardAtOrBelowSnapshotId &&
+      compareCanonicalDecimals(event.snapshotId, discardAtOrBelowSnapshotId) <= 0) return
+    await applyGroupAccessEvent(event)
+  }
+
+  async function completeGroupAccessSnapshot(current: WebSocket, authSnapshotId: string) {
+    failCloseGroupAccess()
+    for (let attempt = 0; attempt < GLOBAL_SYNC_MAX_RESTARTS; attempt += 1) {
+      const staging = new GroupAccessSnapshotStaging(
+        session().organization,
+        authSnapshotId,
+        GROUP_ACCESS_SNAPSHOT_LIMIT
+      )
+      groupAccessStaging = staging
+      try {
+        for (let page = 0; page < GROUP_ACCESS_MAX_PAGES; page += 1) {
+          const packet = await requestGroupAccessPage(current, staging)
+          staging.accept(packet)
+          if (!staging.hasMore) break
+        }
+        if (staging.hasMore) throw new GroupAccessSnapshotRestartError('群访问快照分页超过安全上限')
+        await groupSnapshotStore().commit(staging.committed(), applyCommittedGroupSnapshot)
+        groupAccessStaging = null
+        const buffered = bufferedGroupAccessPackets
+        bufferedGroupAccessPackets = []
+        const committedSnapshotId = currentGroupSnapshotId()
+        for (const packet of buffered) {
+          await validateAndApplyGroupAccessPacket(packet, committedSnapshotId)
+        }
+        return
+      } catch (error) {
+        staging.discard()
+        groupAccessStaging = null
+        failCloseGroupAccess()
+        if (socket !== current || current.readyState !== WebSocket.OPEN) throw error
+        if (!(error instanceof GroupAccessSnapshotRestartError)) throw error
+      }
+    }
+    throw new Error('群访问快照持续失效')
+  }
+
   function handleSocketMessage(current: WebSocket, event: MessageEvent<string>) {
     if (socket !== current) return
     let packet: ImPacket | null = null
@@ -3346,6 +3853,24 @@ export function useImRuntime(
       return
     }
     if (!packet) return
+
+    const authenticated = authenticatedConnection?.socket === current
+    const barrier = groupAccessFrameBarrier
+    if (authenticated && packet.cmd === GROUP_ACCESS_CHANGED_COMMAND &&
+      (barrier?.blocked ||
+        (!groupAccessStaging && isGroupAccessReady(session().organization, session().user.userId)))) {
+      if (!barrier) resetGroupAccessFrameBarrier()
+      void groupAccessFrameBarrier!.enqueueAccess(
+        () => validateAndApplyGroupAccessPacket(packet!)
+      ).catch(() => {})
+      return
+    }
+    if (authenticated && barrier?.blocked) {
+      void barrier.enqueueBusiness(() => {
+        if (socket === current) handleSocketPacket(current, packet!)
+      })
+      return
+    }
 
     handleSocketPacket(current, packet)
   }
@@ -3391,6 +3916,27 @@ export function useImRuntime(
       handleConversationAccessChanged(current, packet)
       return
     }
+    if (packet.cmd === GROUP_ACCESS_SNAPSHOT_ACK_COMMAND) {
+      if (!handleGroupAccessSnapshotAck(packet)) {
+        failSocketAuthentication(current, 'protocol:unexpected-group-access-page', '收到乱序或重复的群访问快照页')
+      }
+      return
+    }
+    if (packet.cmd === GROUP_ACCESS_CHANGED_COMMAND) {
+      if (groupAccessStaging || !isGroupAccessReady(session().organization, session().user.userId)) {
+        if (bufferedGroupAccessPackets.length >= AUTH_RECOVERY_BUFFER_LIMIT) {
+          failSocketAuthentication(current, 'protocol:group-access-buffer-overflow', '群访问变更缓冲超过安全上限')
+          return
+        }
+        bufferedGroupAccessPackets.push(packet)
+        return
+      }
+      if (!groupAccessFrameBarrier) resetGroupAccessFrameBarrier()
+      void groupAccessFrameBarrier!.enqueueAccess(
+        () => validateAndApplyGroupAccessPacket(packet)
+      ).catch(() => {})
+      return
+    }
     if (packet.cmd === 'sync_ack') {
       if (handleGlobalSyncAck(current, packet)) return
       handleConversationSyncAck(current, packet)
@@ -3417,7 +3963,8 @@ export function useImRuntime(
       if (!isFriendRequestRealtimeEventPacketValid(
         packet,
         session().organization,
-        session().user.userId
+        session().user.userId,
+        session().crossOrgAccessSnapshotId
       )) {
         failSocketAuthentication(
           current,
@@ -3716,7 +4263,8 @@ export function useImRuntime(
   async function recoverAuthenticatedConnection(
     current: WebSocket,
     recoverySequence: number,
-    staleServerSnapshotId = ''
+    staleServerSnapshotId = '',
+    authGroupSnapshotId = ''
   ) {
     const cachedConversationIds = new Set(
       conversations.value
@@ -3727,6 +4275,7 @@ export function useImRuntime(
         .map((conversation) => conversation.conversationId)
     )
     failCloseCrossOrgAccess(false)
+    await completeGroupAccessSnapshot(current, authGroupSnapshotId)
     for (let attempt = 0; attempt < GLOBAL_SYNC_MAX_RESTARTS; attempt += 1) {
       const attemptEpoch = captureAccessEpoch()
       try {
@@ -3955,6 +4504,7 @@ export function useImRuntime(
     const accessSnapshotId = normalizeAccessSnapshotId(
       data.cross_org_access_snapshot_id
     )
+    const groupAccessSnapshotId = normalizePositiveDecimal(data.access_snapshot_id)
     const valid = Boolean(
       challenge &&
         challenge.socket === current &&
@@ -3968,7 +4518,8 @@ export function useImRuntime(
         credentialSessionId !== '' &&
         credentialSessionId === challenge.credentialSessionId &&
         sessionId !== '' &&
-        accessSnapshotId !== ''
+        accessSnapshotId !== '' &&
+        groupAccessSnapshotId !== ''
     )
     if (!valid || !challenge) {
       challenge?.traceSpan?.fail({
@@ -4030,11 +4581,14 @@ export function useImRuntime(
       accessSnapshotBehindHighWater
     })
     authenticatedRecoveryPackets = []
+    bufferedGroupAccessPackets = []
+    setGroupAccessNotReady(session().organization, session().user.userId)
     const recoverySequence = ++authenticatedRecoverySequence
     void recoverAuthenticatedConnection(
       current,
       recoverySequence,
-      accessSnapshotBehindHighWater ? accessSnapshotId : ''
+      accessSnapshotBehindHighWater ? accessSnapshotId : '',
+      groupAccessSnapshotId
     ).catch((error) => {
       if (
         socket !== current ||
@@ -4060,6 +4614,14 @@ export function useImRuntime(
     const code = String(packet.data?.code ?? '')
     const clientMsgId = String(packet.client_msg_id ?? '').trim()
     if (clientMsgId !== '') {
+      if (pendingGroupAccessPage?.clientMsgId === clientMsgId) {
+        const request = pendingGroupAccessPage
+        window.clearTimeout(request.timer)
+        pendingGroupAccessPage = null
+        groupAccessStaging?.discard()
+        request.reject(new GroupAccessSnapshotRestartError(message))
+        return
+      }
       if (pendingGlobalSyncRequests.has(clientMsgId)) {
         rejectGlobalSyncRequest(clientMsgId, new Error(message))
         layer.error(message)
@@ -4090,17 +4652,22 @@ export function useImRuntime(
   }
 
   function handleFriendRequestEvent(data: Record<string, any>) {
-    if (data.event !== 'created') {
-      return
-    }
-
     onFriendRequestEvent?.({
-      event: 'created',
-      requestId: Number(data.request_id ?? 0),
-      pendingCount: Number(data.pending_count ?? 0),
-      fromUser: data.from_user ? mapWebImUser(data.from_user) : null,
-      message: String(data.message ?? ''),
-      createTime: String(data.create_time ?? '')
+      event: data.event as FriendRequestPushEvent['event'],
+      eventId: String(data.event_id),
+      requestId: Number(data.request_id),
+      status: data.status as FriendRequestPushEvent['status'],
+      fromOrganization: String(data.from_organization),
+      fromUserId: String(data.from_user_id),
+      toOrganization: String(data.to_organization),
+      toUserId: String(data.to_user_id),
+      targetOrganization: String(data.target_organization),
+      targetUserId: String(data.target_user_id),
+      actorOrganization: String(data.actor_organization),
+      actorUserId: String(data.actor_user_id),
+      crossOrgAccessSnapshotId: data.cross_org_access_snapshot_id as string | null,
+      createTime: String(data.create_time),
+      handleTime: data.handle_time as string | null
     })
   }
 
@@ -4114,6 +4681,7 @@ export function useImRuntime(
     if (!conversation || !actorOrganization || !actorUserId ||
       isSameImIdentity(actorOrganization, actorUserId,
         session().organization, session().user.userId)) return false
+    if (!canUseGroupConversation(conversation, true)) return true
     if (!isConversationParticipantIdentity(
       actorOrganization,
       actorUserId,
@@ -4147,6 +4715,8 @@ export function useImRuntime(
     },
     status: 'delivered' | 'read'
   ) {
+    const conversation = conversations.value.find((value) => value.conversationId === message.conversationId)
+    if (conversation && !canUseGroupConversation(conversation, true)) return ''
     const clientMsgId = createClientMsgId()
     registerPendingControlRequest({
       command: 'ack',
@@ -4174,6 +4744,8 @@ export function useImRuntime(
     messageId: string,
     messageSeq: number
   ) {
+    const conversation = conversations.value.find((value) => value.conversationId === conversationId)
+    if (conversation && !canUseGroupConversation(conversation, true)) return ''
     const clientMsgId = createClientMsgId()
     registerPendingControlRequest({
       command: 'conversation_read',
@@ -4197,6 +4769,7 @@ export function useImRuntime(
     message: ImPacketMessage,
     conversation: ImConversation
   ) {
+    if (!canUseGroupConversation(conversation, true)) return
     if (
       isSameImIdentity(
         message.sender_organization,
@@ -4244,6 +4817,14 @@ export function useImRuntime(
     authoritativeConversationStateLoaded = false
   ) {
     if (revokedConversationIds.has(message.conversation_id)) return true
+    const knownGroup = conversations.value.find((value) => value.conversationId === message.conversation_id)
+    if (Number(message.conversation_type) === 2 &&
+      (!knownGroup || !canUseGroupConversation(knownGroup, true) ||
+        !isGroupMessageVisible(
+          groupAccessEntry(knownGroup),
+          knownGroup.conversationId,
+          message
+        ))) return true
     if (
       source === 'push' &&
       isCrossOrgAccessFailClosed() &&
@@ -4417,7 +4998,7 @@ export function useImRuntime(
           Number(message.message_seq ?? 0)
         )
       }
-      notifyIncomingMessage(conversation.title, preview, shouldShowNotice)
+      notifyIncomingMessage(conversation.conversationId, conversation.title, preview, shouldShowNotice)
       if (shouldShowNotice) {
         notifyTitleIncomingMessage(conversation.title, preview)
       }
@@ -4455,6 +5036,7 @@ export function useImRuntime(
       (item) => item.conversationId === conversationId
     )
     if (!conversation) return false
+    if (!canUseGroupConversation(conversation, true)) return true
     const target = (messages.value[conversation.id] ?? []).find(
       (message) => message.messageId === messageId
     )
@@ -4522,6 +5104,7 @@ export function useImRuntime(
       (item) => item.conversationId === conversationId
     )
     if (!conversation) return false
+    if (!canUseGroupConversation(conversation, true)) return true
     const direction = classifyConversationReadEventDirection(
       data,
       session().organization,
@@ -4771,6 +5354,7 @@ export function useImRuntime(
   function persistConversationRead(conversation: ImConversation) {
     if (conversation.virtual || !conversation.conversationId) return
     if (isCrossOrgAccessFailClosed() && isCrossOrgSingle(conversation)) return
+    if (!canUseGroupConversation(conversation, true)) return
     const latestIncoming = [...(messages.value[conversation.id] ?? [])]
       .filter((message) => message.side === 'in' && message.messageId)
       .sort((left, right) => Number(right.messageSeq ?? 0) - Number(left.messageSeq ?? 0))[0]
@@ -4807,7 +5391,11 @@ export function useImRuntime(
 
   function markAllConversationsRead() {
     conversations.value = conversations.value.map((item) => ({ ...item, unread: 0 }))
-    if (isCrossOrgAccessFailClosed()) {
+    if (isCrossOrgAccessFailClosed() ||
+      !isGroupAccessReady(session().organization, session().user.userId) ||
+      conversations.value.some((value) =>
+        value.conversationType === 'group' && !canUseGroupConversation(value, true)
+      )) {
       layer.warning('跨机构访问尚未初始化，已读状态暂未批量同步')
       return Promise.resolve()
     }
@@ -4819,6 +5407,10 @@ export function useImRuntime(
   async function updateConversationSetting(conversationId: string, settings: { isPinned?: boolean; isMuted?: boolean }) {
     const conversation = conversations.value.find((item) => item.id === conversationId)
     if (!conversation || conversation.virtual) return
+    if (!canUseGroupConversation(conversation, true)) {
+      layer.warning('当前群访问仅允许查看授权历史')
+      return
+    }
     if (isCrossOrgAccessFailClosed() && isCrossOrgSingle(conversation)) {
       layer.warning('当前跨机构访问已关闭')
       return
@@ -4852,6 +5444,10 @@ export function useImRuntime(
     const conversation = conversations.value.find((item) => item.id === conversationId)
     if (!conversation || conversation.virtual || !conversation.conversationId || conversation.conversationType !== 'group') {
       layer.warning('请选择群聊')
+      return null
+    }
+    if (!canUseGroupConversation(conversation, true)) {
+      layer.warning('当前群访问仅允许查看授权历史')
       return null
     }
 
@@ -4891,8 +5487,10 @@ export function useImRuntime(
   async function searchActiveMessages(keyword: string, messageType?: number) {
     const conversation = activeConversation.value
     if (!conversation || conversation.virtual || !conversation.conversationId) return []
+    if (!canUseGroupConversation(conversation)) return []
     const rows = await searchConversationMessages(config(), session(), {
       conversationId: conversation.conversationId,
+      conversationType: conversation.conversationType,
       keyword,
       messageType,
       limit: 80
@@ -4900,7 +5498,7 @@ export function useImRuntime(
     return rows.map((message) => mapPacketMessage(message, session(), conversation))
   }
 
-  function notifyIncomingMessage(title: string, body: string, showNotice: boolean) {
+  function notifyIncomingMessage(conversationId: string, title: string, body: string, showNotice: boolean) {
     const settings = notificationSettings()
     if (!showNotice) {
       return
@@ -4908,14 +5506,21 @@ export function useImRuntime(
     if (settings.soundEnabled) {
       playNotificationSound()
     }
-    layer.info(`${title}：${body}`, 3200)
+    const toastId = layer.info(`${title}：${body}`, 3200)
+    const toastIds = notificationToastsByConversation.get(conversationId) ?? new Set<number>()
+    toastIds.add(toastId)
+    notificationToastsByConversation.set(conversationId, toastIds)
     if (
       settings.browserEnabled &&
       shouldShowBrowserSystemNotification() &&
       'Notification' in window &&
       Notification.permission === 'granted'
     ) {
-      new Notification(title, { body })
+      const notification = new Notification(title, { body })
+      const current = notificationsByConversation.get(conversationId) ?? new Set<Notification>()
+      current.add(notification)
+      notificationsByConversation.set(conversationId, current)
+      notification.addEventListener('close', () => current.delete(notification), { once: true })
     }
   }
 
@@ -5020,6 +5625,8 @@ export function useImRuntime(
       pendingAuthChallenge = null
     }
     if (!target || authenticatedConnection?.socket === target) {
+      failCloseGroupAccess()
+      bufferedGroupAccessPackets = []
       authenticatedConnection = null
       authenticatedAccessSnapshotBehindHighWater = false
       authenticatedStaleAccessSnapshotId = ''

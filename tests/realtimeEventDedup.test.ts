@@ -874,50 +874,155 @@ test('friend request control events require their own canonical schema before ob
       event: 'created',
       event_id: eventId(901),
       request_id: 77,
-      from_organization: 902,
+      status: 1,
+      from_organization: '901',
       from_user_id: 'user_b',
-      to_organization: 901,
+      to_organization: '901',
       to_user_id: 'user_a',
-      message: 'hello',
-      pending_count: 2,
+      target_organization: '901',
+      target_user_id: 'user_a',
+      actor_organization: '901',
+      actor_user_id: 'user_b',
+      cross_org_access_snapshot_id: null,
       create_time: '2026-07-10 14:10:00',
-      from_user: {
-        organization: 902,
-        user_id: 'user_b'
-      }
+      handle_time: null
     }
   }
-  assert.equal(isFriendRequestRealtimeEventPacketValid(packet, '901', 'user_a'), true)
+  assert.equal(isFriendRequestRealtimeEventPacketValid(packet, '901', 'user_a', '0'), true)
+
+  const stringHome = structuredClone(packet) as any
+  stringHome.organization = '901'
+  assert.equal(isFriendRequestRealtimeEventPacketValid(stringHome, '901', 'user_a', '0'), false)
 
   const missingId = structuredClone(packet)
   delete (missingId.data as Partial<typeof packet.data>).event_id
-  assert.equal(isFriendRequestRealtimeEventPacketValid(missingId, '901', 'user_a'), false)
+  assert.equal(isFriendRequestRealtimeEventPacketValid(missingId, '901', 'user_a', '0'), false)
 
-  const wrongTarget = structuredClone(packet)
-  wrongTarget.data.to_user_id = 'user_c'
-  assert.equal(isFriendRequestRealtimeEventPacketValid(wrongTarget, '901', 'user_a'), false)
-
-  const wrongTargetOrganization = structuredClone(packet)
-  wrongTargetOrganization.data.to_organization = 902
+  const deprecatedSnapshot = structuredClone(packet) as any
+  deprecatedSnapshot.data.pending_count = 2
   assert.equal(
-    isFriendRequestRealtimeEventPacketValid(wrongTargetOrganization, '901', 'user_a'),
+    isFriendRequestRealtimeEventPacketValid(deprecatedSnapshot, '901', 'user_a', '0'),
     false
   )
 
-  const mismatchedSenderIdentity = structuredClone(packet)
-  mismatchedSenderIdentity.data.from_user.organization = 903
+  const wrongTarget = structuredClone(packet)
+  wrongTarget.data.target_user_id = 'user_c'
+  assert.equal(isFriendRequestRealtimeEventPacketValid(wrongTarget, '901', 'user_a', '0'), false)
+
+  const wrongTargetOrganization = structuredClone(packet)
+  wrongTargetOrganization.data.target_organization = '902'
   assert.equal(
-    isFriendRequestRealtimeEventPacketValid(mismatchedSenderIdentity, '901', 'user_a'),
+    isFriendRequestRealtimeEventPacketValid(wrongTargetOrganization, '901', 'user_a', '0'),
+    false
+  )
+
+  const mismatchedActorIdentity = structuredClone(packet)
+  mismatchedActorIdentity.data.actor_user_id = 'user_c'
+  assert.equal(
+    isFriendRequestRealtimeEventPacketValid(mismatchedActorIdentity, '901', 'user_a', '0'),
     false
   )
 
   const invalidRequest = structuredClone(packet)
   invalidRequest.data.request_id = 0
-  assert.equal(isFriendRequestRealtimeEventPacketValid(invalidRequest, '901', 'user_a'), false)
+  assert.equal(isFriendRequestRealtimeEventPacketValid(invalidRequest, '901', 'user_a', '0'), false)
+
+  const invalidStatus = structuredClone(packet)
+  invalidStatus.data.status = 2
+  assert.equal(isFriendRequestRealtimeEventPacketValid(invalidStatus, '901', 'user_a', '0'), false)
+
+  const selfRequest = structuredClone(packet)
+  selfRequest.data.from_user_id = 'user_a'
+  selfRequest.data.actor_user_id = 'user_a'
+  assert.equal(isFriendRequestRealtimeEventPacketValid(selfRequest, '901', 'user_a', '0'), false)
+
+  const nonCanonicalOrganization = structuredClone(packet) as any
+  nonCanonicalOrganization.data.from_organization = 901
+  assert.equal(
+    isFriendRequestRealtimeEventPacketValid(nonCanonicalOrganization, '901', 'user_a', '0'),
+    false
+  )
+
+  const sameOrganizationSnapshot = structuredClone(packet) as any
+  sameOrganizationSnapshot.data.cross_org_access_snapshot_id = '42'
+  assert.equal(
+    isFriendRequestRealtimeEventPacketValid(sameOrganizationSnapshot, '901', 'user_a', '42'),
+    false
+  )
+
+  const invalidDate = structuredClone(packet)
+  invalidDate.data.create_time = '2026-02-30 14:10:00'
+  assert.equal(isFriendRequestRealtimeEventPacketValid(invalidDate, '901', 'user_a', '0'), false)
 
   const window = new RealtimeEventDedupWindow('901', 'user_a', new MemoryStorage())
   assert.equal(window.observe(packet.data.event_id), 'new')
   assert.equal(window.observe(packet.data.event_id), 'duplicate')
+})
+
+test('friend request terminal events bind actor, recipient and cross-organization epoch', () => {
+  const accepted = {
+    cmd: 'friend_request',
+    organization: 902,
+    data: {
+      event: 'accepted',
+      event_id: eventId(902),
+      request_id: 78,
+      status: 2,
+      from_organization: '902',
+      from_user_id: 'user_b',
+      to_organization: '901',
+      to_user_id: 'user_a',
+      target_organization: '902',
+      target_user_id: 'user_b',
+      actor_organization: '901',
+      actor_user_id: 'user_a',
+      cross_org_access_snapshot_id: '42',
+      create_time: '2026-07-10 14:10:00',
+      handle_time: '2026-07-10 14:11:00'
+    }
+  }
+  assert.equal(
+    isFriendRequestRealtimeEventPacketValid(accepted, '902', 'user_b', '42'),
+    true
+  )
+
+  const rejected = structuredClone(accepted)
+  rejected.data.event = 'rejected'
+  rejected.data.event_id = eventId(903)
+  rejected.data.status = 3
+  assert.equal(
+    isFriendRequestRealtimeEventPacketValid(rejected, '902', 'user_b', '42'),
+    true
+  )
+
+  for (const snapshotId of [null, '0', '01', '41', 42]) {
+    const candidate = structuredClone(accepted) as any
+    candidate.data.cross_org_access_snapshot_id = snapshotId
+    assert.equal(
+      isFriendRequestRealtimeEventPacketValid(candidate, '902', 'user_b', '42'),
+      false,
+      `invalid event snapshot: ${String(snapshotId)}`
+    )
+  }
+  assert.equal(
+    isFriendRequestRealtimeEventPacketValid(accepted, '902', 'user_b', '43'),
+    false
+  )
+
+  const wrongActor = structuredClone(accepted)
+  wrongActor.data.actor_organization = '902'
+  wrongActor.data.actor_user_id = 'user_b'
+  assert.equal(
+    isFriendRequestRealtimeEventPacketValid(wrongActor, '902', 'user_b', '42'),
+    false
+  )
+
+  const missingHandleTime = structuredClone(accepted)
+  missingHandleTime.data.handle_time = null as unknown as string
+  assert.equal(
+    isFriendRequestRealtimeEventPacketValid(missingHandleTime, '902', 'user_b', '42'),
+    false
+  )
 })
 
 test('cross-organization PUSH keeps packet and message scoped to recipient home', () => {
